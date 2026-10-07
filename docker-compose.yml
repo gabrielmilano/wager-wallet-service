@@ -1,0 +1,126 @@
+# Ambiente local: PostgreSQL, LocalStack (SQS), Keycloak e a aplicação.
+#
+#   make up     sobe tudo e espera os healthchecks
+#   make clean  derruba e apaga os volumes (necessário para rodar o initdb de novo)
+#
+# Todos os valores têm padrão; um .env (modelo em .env.example) é opcional.
+# As senhas e secrets aqui são apenas para desenvolvimento local.
+
+name: wager-wallet
+
+services:
+  postgres:
+    image: postgres:18.6-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      APP_MIGRATOR_PASSWORD: ${APP_MIGRATOR_PASSWORD:-app_migrator}
+      APP_RUNTIME_PASSWORD: ${APP_RUNTIME_PASSWORD:-app_runtime}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - ./deploy/postgres/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # Via TCP: durante o initdb o servidor temporário só escuta no socket
+      # Unix, então isto só passa depois que o init terminou.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "wager_wallet"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    mem_limit: 256m
+
+  localstack:
+    # Última versão Community que não exige auth token (ADR 0008).
+    image: localstack/localstack:4.14.0@sha256:3ebc37595918b8accb852f8048fef2aff047d465167edd655528065b07bc364a
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+      SQS_INPUT_QUEUE_NAME: ${SQS_INPUT_QUEUE_NAME:-wager-transactions.fifo}
+      SQS_INPUT_DLQ_NAME: ${SQS_INPUT_DLQ_NAME:-wager-transactions-dlq.fifo}
+      SQS_EVENTS_QUEUE_NAME: ${SQS_EVENTS_QUEUE_NAME:-wallet-events.fifo}
+    ports:
+      - "4566:4566"
+    volumes:
+      - ./deploy/localstack/init/ready.d:/etc/localstack/init/ready.d:ro
+    healthcheck:
+      # Arquivo criado pelo script de filas somente se tudo deu certo.
+      test: ["CMD", "test", "-f", "/tmp/queues-ready"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+    mem_limit: 512m
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.0
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      # iss fixo: o token tem o mesmo iss pedido de fora (localhost:8180) ou
+      # de dentro da rede (keycloak:8080). Ver ADR 0009.
+      KC_HOSTNAME: http://localhost:8180
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HEALTH_ENABLED: "true"
+      JAVA_OPTS_KC_HEAP: "-Xms256m -Xmx512m"
+    ports:
+      - "8180:8080"
+    volumes:
+      - ./deploy/keycloak:/opt/keycloak/data/import:ro
+    healthcheck:
+      # A imagem não tem curl: HTTP "na mão" pela porta de gerenciamento.
+      test:
+        - CMD-SHELL
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/9000 &&
+          printf 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 &&
+          grep -q '"UP"' <&3
+      interval: 5s
+      timeout: 5s
+      retries: 36
+      start_period: 20s
+    mem_limit: 768m
+
+  app:
+    build: .
+    image: wager-wallet-service:local
+    environment:
+      APP_HTTP_ADDR: :8081
+      APP_SHUTDOWN_TIMEOUT: 20s
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      GOMEMLIMIT: 100MiB
+      DATABASE_URL: postgres://app_runtime:${APP_RUNTIME_PASSWORD:-app_runtime}@postgres:5432/wager_wallet?sslmode=disable
+      DB_LOCK_TIMEOUT: 3s
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_ENDPOINT_URL: http://localstack:4566
+      SQS_INPUT_QUEUE_NAME: ${SQS_INPUT_QUEUE_NAME:-wager-transactions.fifo}
+      SQS_INPUT_DLQ_NAME: ${SQS_INPUT_DLQ_NAME:-wager-transactions-dlq.fifo}
+      SQS_EVENTS_QUEUE_NAME: ${SQS_EVENTS_QUEUE_NAME:-wallet-events.fifo}
+      # iss esperado (texto) e chaves buscadas direto na rede interna (ADR 0009).
+      OIDC_ISSUER_URL: http://localhost:8180/realms/wager
+      OIDC_JWKS_URL: http://keycloak:8080/realms/wager/protocol/openid-connect/certs
+      OIDC_AUDIENCE: wager-wallet-service
+    ports:
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+    healthcheck:
+      # Distroless não tem curl nem shell: o próprio binário faz a checagem.
+      test: ["CMD", "/wallet-service", "healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+    # Maior que APP_SHUTDOWN_TIMEOUT, para o Docker não matar o processo
+    # antes de o Fx terminar o encerramento.
+    stop_grace_period: 30s
+    mem_limit: 128m
+
+volumes:
+  pgdata:
