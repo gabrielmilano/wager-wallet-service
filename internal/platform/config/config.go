@@ -9,6 +9,10 @@ import (
 	"time"
 )
 
+// DefaultHTTPAddr é o endereço HTTP usado quando APP_HTTP_ADDR não é
+// informado. Também é lido pelo subcomando healthcheck.
+const DefaultHTTPAddr = ":8081"
+
 // Config é a configuração da aplicação, lida de variáveis de ambiente.
 type Config struct {
 	HTTPAddr        string
@@ -60,7 +64,7 @@ func Load(lookup LookupFunc) (Config, error) {
 	r := reader{lookup: lookup}
 
 	cfg := Config{
-		HTTPAddr:        r.str("APP_HTTP_ADDR", ":8081"),
+		HTTPAddr:        r.str("APP_HTTP_ADDR", DefaultHTTPAddr),
 		InstanceID:      r.str("APP_INSTANCE_ID", ""),
 		ShutdownTimeout: r.duration("APP_SHUTDOWN_TIMEOUT", 20*time.Second),
 		LogLevel:        r.level("LOG_LEVEL", slog.LevelInfo),
