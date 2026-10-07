@@ -51,7 +51,7 @@ _Testes de integração, múltiplas instâncias e simulações de falha: a defin
 
 ## Arquitetura
 
-Decisões técnicas em `ARCHITECTURE.md` e nos ADRs em [docs/adr/](docs/adr/).
+Decisões técnicas em [ARCHITECTURE.md](ARCHITECTURE.md) e nos ADRs em [docs/adr/](docs/adr/).
 
 ## Uso de IA
 
