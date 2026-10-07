@@ -20,10 +20,12 @@ consumidor. O IdP recomendado é o Keycloak, com `client_credentials`.
 - O serviço valida o JWT localmente: assinatura pelas chaves do JWKS do realm, `iss`,
   `aud` (`wager-wallet-service`) e `exp`.
 - O `providerId` vem de um **claim dedicado `provider_id`**, preenchido por um mapper
-  fixo (hardcoded claim) no client de cada provedor. Um **audience mapper** no realm
-  coloca `wager-wallet-service` em `aud` (configurado na Fase 02).
-- Roles de client: `provider` (envia e consulta as próprias operações) e `wallet-admin`
-  (serviço interno: abre carteiras, lê carteira e extrato, reconcilia).
+  fixo (hardcoded claim) no client de cada provedor. Um **audience mapper**, também
+  configurado em cada client, coloca `wager-wallet-service` em `aud` (Fase 02).
+- **Roles de realm** (não roles de client): `provider` (envia e consulta as próprias
+  operações) e `wallet-admin` (serviço interno: abre carteiras, lê carteira e extrato,
+  reconcilia). São atribuídas à service account de cada client e chegam no token em
+  `realm_access.roles`, que é onde a aplicação as lê.
 - O middleware HTTP coloca um `Principal{ProviderID, Roles}` no `context.Context`. Se o
   corpo trouxer um `providerId` diferente do token → `403 PROVIDER_FORBIDDEN`, sem gravar
   nada. Consultas por transação filtram pelo `providerId` do token. *Proposta, a
@@ -45,6 +47,9 @@ consumidor. O IdP recomendado é o Keycloak, com `client_credentials`.
 
 ## Alternativas consideradas
 
+- **Roles de client** (em `resource_access.<client>.roles`): permitiriam permissões
+  diferentes por client consumidor, mas há um único serviço protegido e duas roles; roles
+  de realm deixam o token e a leitura mais simples.
 - **Usar `client_id`/`azp` como `providerId`:** dispensa o mapper, mas acopla a regra de
   negócio ao nome técnico do client e impede trocar o client sem trocar o provedor.
 - **Introspecção do token no Keycloak a cada chamada:** detecta revogação imediata, mas

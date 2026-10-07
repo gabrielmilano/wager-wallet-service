@@ -167,8 +167,9 @@ Detalhes em [ADR 0003](docs/adr/0003-identidade-do-provedor.md).
   de dentro da rede do Docker.
 - **Identidade:** o `providerId` vem do claim `provider_id` do token, nunca do corpo. Um
   corpo com outro `providerId` é recusado com `403 PROVIDER_FORBIDDEN`.
-- **Permissões:** role `provider` (enviar e consultar as próprias operações) e role
-  `wallet-admin` (operações de carteira, restritas ao serviço interno).
+- **Permissões:** roles **de realm** `provider` (enviar e consultar as próprias
+  operações) e `wallet-admin` (operações de carteira, restritas ao serviço interno),
+  atribuídas à service account de cada client e lidas do claim `realm_access.roles`.
 - **SQS:** a mensagem não carrega token. A entrada é protegida pela política do broker:
   só as credenciais de um provedor podem enviar para a fila. Na AWS real, o consumidor
   mapearia o atributo de sistema `SenderId` da mensagem para um `providerId` e recusaria
@@ -176,8 +177,8 @@ Detalhes em [ADR 0003](docs/adr/0003-identidade-do-provedor.md).
   políticas IAM não são aplicadas; essa é uma limitação documentada.** As validações de
   domínio continuam no consumidor. As políticas que seriam aplicadas na AWS estão em
   [deploy/aws/iam-policies.md](deploy/aws/iam-policies.md).
-- **Identidades de teste:** clients `provider-a`, `provider-b` (role `provider`) e
-  `wallet-internal` (role `wallet-admin`) no realm
+- **Identidades de teste:** clients `provider-a`, `provider-b` (role de realm
+  `provider`) e `wallet-internal` (role de realm `wallet-admin`) no realm
   [deploy/keycloak/realm-wager.json](deploy/keycloak/realm-wager.json).
 
 *A definir (Fase 07):* matriz rota × role.

@@ -88,7 +88,7 @@ O realm `wager` é importado automaticamente de
 [deploy/keycloak/realm-wager.json](deploy/keycloak/realm-wager.json). Clients de teste
 (fluxo `client_credentials`; os secrets são apenas locais):
 
-| Client | Secret | Role | Claim `provider_id` |
+| Client | Secret | Role de realm (`realm_access.roles`) | Claim `provider_id` |
 | --- | --- | --- | --- |
 | `provider-a` | `provider-a-secret` | `provider` | `provider-a` |
 | `provider-b` | `provider-b-secret` | `provider` | `provider-b` |
