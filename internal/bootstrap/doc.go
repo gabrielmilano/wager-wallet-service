@@ -4,5 +4,6 @@
 //
 // É o único pacote (além de cmd/) que importa Fx (ADR 0001).
 //
-// Implementação a partir da Fase 02.
+// Na Fase 02 compõe config, logger e o servidor HTTP; os demais componentes
+// entram nas fases seguintes.
 package bootstrap
