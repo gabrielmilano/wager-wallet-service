@@ -1,0 +1,12 @@
+# Só o necessário para compilar entra no contexto de build.
+.git
+.env
+.env.*
+bin/
+docs/
+notes/
+deploy/
+migrations/
+test/
+*.md
+CLAUDE.local.md
