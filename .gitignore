@@ -2,3 +2,25 @@
 docs/DESAFIO.md
 docs/01-modelagem.md
 notes/
+
+# Binários e artefatos de build
+/bin/
+*.exe
+*.test
+*.out
+
+# Cobertura de testes
+coverage.*
+*.coverprofile
+
+# Variáveis de ambiente locais (usar .env.example como modelo)
+.env
+.env.*
+!.env.example
+
+# Editores e sistema operacional
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
