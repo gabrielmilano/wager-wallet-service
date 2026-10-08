@@ -29,6 +29,15 @@ func Options(cfg config.Config) fx.Option {
 		postgresModule,
 		appModule,
 	}
+	if cfg.Components.SQSConsumer || cfg.Components.OutboxPublisher {
+		opts = append(opts, sqsModule)
+	}
+	if cfg.Components.SQSConsumer {
+		opts = append(opts, consumerModule)
+	}
+	if cfg.Components.OutboxPublisher {
+		opts = append(opts, outboxModule)
+	}
 	if cfg.Components.HTTP {
 		opts = append(opts, httpModule)
 	}
