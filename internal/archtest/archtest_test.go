@@ -1,6 +1,6 @@
 // Package archtest verifica a regra de dependência entre camadas (ADR 0001):
-// domain não conhece ninguém, app não conhece adapter e só bootstrap (e cmd/)
-// conhece o Fx.
+// domain só usa a stdlib (sem net/http e database/sql), UUID e o próprio
+// domínio; app não conhece adapter; só bootstrap (e cmd/) conhece o Fx.
 package archtest
 
 import (
@@ -33,16 +33,31 @@ var infra = []string{
 	"database/sql",
 }
 
+// O domínio usa lista de permitidos, não de proibidos: qualquer dependência
+// nova precisa ser aceita aqui explicitamente.
+const domainLayer = module + "/internal/domain"
+
+// domainAllowed: biblioteca padrão (exceto net/http e database/sql), o pacote
+// de UUID e o próprio domínio.
+func domainAllowed(imp string) bool {
+	switch {
+	case under(imp, "net/http"), under(imp, "database/sql"):
+		return false
+	case under(imp, "github.com/google/uuid"), under(imp, domainLayer):
+		return true
+	default:
+		return isStdlib(imp)
+	}
+}
+
+// isStdlib: pacotes da biblioteca padrão não têm ponto no primeiro elemento
+// do caminho (ex.: "strings", "encoding/json"; não "github.com/...").
+func isStdlib(imp string) bool {
+	first, _, _ := strings.Cut(imp, "/")
+	return !strings.Contains(first, ".")
+}
+
 var rules = []rule{
-	{
-		layer: module + "/internal/domain",
-		forbidden: append([]string{
-			module + "/internal/app",
-			module + "/internal/adapter",
-			module + "/internal/platform",
-			module + "/internal/bootstrap",
-		}, infra...),
-	},
 	{
 		layer: module + "/internal/app",
 		forbidden: append([]string{
@@ -78,6 +93,13 @@ func under(path, prefix string) bool {
 // violations devolve os imports de pkg que alguma regra proíbe.
 func violations(pkg string, imports []string) []string {
 	var found []string
+	if under(pkg, domainLayer) {
+		for _, imp := range imports {
+			if !domainAllowed(imp) {
+				found = append(found, imp)
+			}
+		}
+	}
 	for _, r := range rules {
 		if !under(pkg, r.layer) {
 			continue
@@ -112,6 +134,10 @@ func TestViolations(t *testing.T) {
 		{"adapter importa bootstrap", module + "/internal/adapter/httpapi", []string{module + "/internal/bootstrap"}, []string{module + "/internal/bootstrap"}},
 		{"bootstrap importa fx", module + "/internal/bootstrap", []string{"go.uber.org/fx"}, nil},
 		{"prefixo parcial não casa", module + "/internal/domain/money", []string{"net/httptest"}, nil},
+		{"domain importa uuid", module + "/internal/domain/wallet", []string{"github.com/google/uuid"}, nil},
+		{"domain importa biblioteca não listada", module + "/internal/domain/money", []string{"github.com/shopspring/decimal"}, []string{"github.com/shopspring/decimal"}},
+		{"domain importa subpacote de net/http", module + "/internal/domain/money", []string{"net/http/httptest"}, []string{"net/http/httptest"}},
+		{"domain importa platform", module + "/internal/domain/money", []string{module + "/internal/platform/config"}, []string{module + "/internal/platform/config"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

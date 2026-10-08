@@ -2,6 +2,4 @@
 // tipados (WagerTransactionProcessed, WagerTransactionRejected,
 // WalletBalanceChanged, WagerTransactionPendingReference). Tipo e versão são
 // definidos pelo construtor de cada evento.
-//
-// Implementação na Fase 04.
 package event

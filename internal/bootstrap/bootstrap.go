@@ -23,6 +23,8 @@ func Options(cfg config.Config) fx.Option {
 		fx.WithLogger(newFxLogger),
 		fx.StopTimeout(cfg.ShutdownTimeout),
 		fx.Invoke(logLifecycle),
+		postgresModule,
+		appModule,
 	}
 	if cfg.Components.HTTP {
 		opts = append(opts, httpModule)

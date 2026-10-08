@@ -41,6 +41,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.ShutdownTimeout != 20*time.Second {
 		t.Errorf("ShutdownTimeout = %v, want 20s", cfg.ShutdownTimeout)
 	}
+	if cfg.DBMaxConns != 10 {
+		t.Errorf("DBMaxConns = %d, want 10", cfg.DBMaxConns)
+	}
 	if cfg.DBLockTimeout != 3*time.Second {
 		t.Errorf("DBLockTimeout = %v, want 3s", cfg.DBLockTimeout)
 	}
@@ -103,6 +106,8 @@ func TestLoadErrors(t *testing.T) {
 		{"obrigatória ausente", func(e map[string]string) { delete(e, "DATABASE_URL") }, "DATABASE_URL é obrigatória"},
 		{"obrigatória vazia", func(e map[string]string) { e["OIDC_JWKS_URL"] = "" }, "OIDC_JWKS_URL é obrigatória"},
 		{"duração inválida", func(e map[string]string) { e["DB_LOCK_TIMEOUT"] = "3" }, "DB_LOCK_TIMEOUT inválida"},
+		{"inteiro inválido", func(e map[string]string) { e["DB_MAX_CONNS"] = "dez" }, "DB_MAX_CONNS inválida"},
+		{"conexões fora do intervalo", func(e map[string]string) { e["DB_MAX_CONNS"] = "0" }, "DB_MAX_CONNS deve estar entre 1 e 1000"},
 		{"duração zero", func(e map[string]string) { e["APP_SHUTDOWN_TIMEOUT"] = "0s" }, "APP_SHUTDOWN_TIMEOUT deve ser maior que zero"},
 		{"booleano inválido", func(e map[string]string) { e["APP_ENABLE_HTTP"] = "sim" }, "APP_ENABLE_HTTP inválida"},
 		{"nível de log inválido", func(e map[string]string) { e["LOG_LEVEL"] = "verbose" }, "LOG_LEVEL inválido"},

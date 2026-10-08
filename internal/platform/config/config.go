@@ -22,6 +22,7 @@ type Config struct {
 
 	DatabaseURL   string
 	DBLockTimeout time.Duration
+	DBMaxConns    int32
 
 	AWS  AWS
 	OIDC OIDC
@@ -71,6 +72,7 @@ func Load(lookup LookupFunc) (Config, error) {
 
 		DatabaseURL:   r.required("DATABASE_URL"),
 		DBLockTimeout: r.duration("DB_LOCK_TIMEOUT", 3*time.Second),
+		DBMaxConns:    int32(r.integer("DB_MAX_CONNS", 10)),
 
 		AWS: AWS{
 			Region:          r.required("AWS_REGION"),
@@ -94,6 +96,9 @@ func Load(lookup LookupFunc) (Config, error) {
 
 	if cfg.ShutdownTimeout <= 0 {
 		r.fail("APP_SHUTDOWN_TIMEOUT deve ser maior que zero")
+	}
+	if cfg.DBMaxConns < 1 || cfg.DBMaxConns > 1000 {
+		r.fail("DB_MAX_CONNS deve estar entre 1 e 1000")
 	}
 	if cfg.DBLockTimeout <= 0 {
 		r.fail("DB_LOCK_TIMEOUT deve ser maior que zero")
@@ -151,6 +156,19 @@ func (r *reader) duration(key string, def time.Duration) time.Duration {
 		return def
 	}
 	return d
+}
+
+func (r *reader) integer(key string, def int) int {
+	v, ok := r.lookup(key)
+	if !ok || v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		r.fail(fmt.Sprintf("%s inválida (%q): use um inteiro", key, v))
+		return def
+	}
+	return n
 }
 
 func (r *reader) boolean(key string, def bool) bool {
