@@ -67,8 +67,15 @@ type apiResponse struct {
 
 func (r apiResponse) str(key string) string { s, _ := r.body[key].(string); return s }
 
-// call faz uma requisição à API. body pode ser string (JSON cru) ou valor.
+// call faz uma requisição à instância padrão (APP_BASE_URL).
 func call(t *testing.T, method, path, bearer string, headers map[string]string, body any) apiResponse {
+	t.Helper()
+	return callAt(t, env("APP_BASE_URL", "http://localhost:8081"), method, path, bearer, headers, body)
+}
+
+// callAt faz uma requisição a uma instância específica. body pode ser string
+// (JSON cru) ou valor.
+func callAt(t *testing.T, base, method, path, bearer string, headers map[string]string, body any) apiResponse {
 	t.Helper()
 	var reader io.Reader
 	switch b := body.(type) {
@@ -79,7 +86,7 @@ func call(t *testing.T, method, path, bearer string, headers map[string]string, 
 		data, _ := json.Marshal(b)
 		reader = bytes.NewReader(data)
 	}
-	req, err := http.NewRequest(method, env("APP_BASE_URL", "http://localhost:8081")+path, reader)
+	req, err := http.NewRequest(method, base+path, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
