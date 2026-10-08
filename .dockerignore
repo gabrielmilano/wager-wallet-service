@@ -6,7 +6,6 @@ bin/
 docs/
 notes/
 deploy/
-migrations/
 test/
 *.md
 CLAUDE.local.md

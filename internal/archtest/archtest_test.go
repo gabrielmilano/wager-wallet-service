@@ -28,6 +28,7 @@ var infra = []string{
 	"go.uber.org/fx",
 	"github.com/jackc",
 	"github.com/aws",
+	"github.com/golang-migrate",
 	"net/http",
 	"database/sql",
 }

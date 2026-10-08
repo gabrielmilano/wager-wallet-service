@@ -79,7 +79,7 @@ internal/
     config/ logging/ metrics/ health/
   bootstrap/             módulos Fx e ciclo de vida
   archtest/              teste da regra de dependência
-migrations/              migrations golang-migrate (up e down)
+migrations/              migrations golang-migrate (up e down), embutidas no binário
 test/integration/        testes de integração (build tag integration)
 deploy/                  provisionamento do Compose (Postgres, LocalStack, Keycloak) e políticas IAM
 docs/adr/                Architecture Decision Records
@@ -150,6 +150,11 @@ A camada `app` declara `store.TxRunner`, com
 pgx. Os repositórios só existem dentro do callback, então toda gravação acontece dentro
 de uma transação. Erro no callback → rollback; sucesso → commit. Dentro do callback não
 há I/O externo: eventos saem pela outbox depois do commit.
+
+**Erro no commit:** com `PgError` (por exemplo, um trigger diferido recusou), o
+resultado é conhecido, a transação foi desfeita e o erro é definitivo; sem resposta do
+servidor, o resultado é desconhecido e tratado como transitório (a idempotência torna a
+repetição segura).
 
 *A definir (Fase 05):* isolamento, `FOR UPDATE`, ordem fixa de locks e `lock_timeout`.
 
@@ -233,7 +238,32 @@ de tentativas, visibility timeout e mecanismo de envio à DLQ (Fase 08).
 *A definir (Fase 04):* limites numéricos, regras exatas de formato e overflow na
 aritmética.
 
-## 10. Ambiente local e testes de integração
+## 10. Schema e invariantes no banco
+
+Cinco tabelas (`wallets`, `wager_transactions`, `wallet_ledger_entries`,
+`inbox_messages`, `outbox_events`), criadas por migrations embutidas no binário
+([ADR 0010](docs/adr/0010-migrations-embutidas.md)). O banco é a última linha de defesa
+([ADR 0011](docs/adr/0011-invariantes-no-banco.md)), em três camadas:
+
+1. **Constraints:** CHECKs (saldo ≥ 0, moeda em `BRL`/`USD`/`EUR`, valor por tipo,
+   conta de cada lançamento), UNIQUEs (carteira por jogador e moeda; operação por
+   provedor e ID externo; chave de idempotência por provedor; uma abertura por carteira;
+   uma reversão processada por original; uma versão por carteira no extrato) e FKs
+   compostas (moeda e jogador da carteira; lançamento da operação da mesma carteira).
+2. **GRANTs:** `app_runtime` sem `DELETE`/`TRUNCATE`; extrato só `SELECT`/`INSERT`;
+   `UPDATE` por coluna nas demais tabelas.
+3. **Triggers** (valem para qualquer role): extrato append-only; `wager_transactions` sem
+   `DELETE`/`TRUNCATE`; sequência do extrato; máquina de estados com terminais
+   congelados; versão da carteira acompanha o saldo; e, no commit (diferidos),
+   carteira igual ao último lançamento, lançamento só de operação `PROCESSED` e nenhum
+   `PENDING` confirmado.
+
+Erros de trigger usam SQLSTATE de classe 23 e o nome da regra em `ConstraintName`, como
+as constraints declarativas. O trigger de sequência do extrato não é seguro sozinho sob
+concorrência: a garantia é o `UNIQUE (wallet_id, wallet_version)` somado ao
+`FOR UPDATE` na carteira (Fase 05).
+
+## 11. Ambiente local e testes de integração
 
 O `docker-compose.yml` sobe PostgreSQL 18.6, LocalStack 4.14.0, Keycloak 26.8.0 e a
 aplicação, todos com healthcheck e limite de memória. A aplicação só inicia depois das
@@ -244,6 +274,7 @@ dependências saudáveis.
 | PostgreSQL | `deploy/postgres/initdb/01-roles.sh`: banco e roles, senhas por variável | `pg_isready` via TCP (só passa após o initdb) | 256 MB |
 | LocalStack | `deploy/localstack/init/ready.d/10-queues.sh`: 3 filas FIFO e redrive | arquivo de pronto criado pelo script | 512 MB |
 | Keycloak | import do realm `wager` | `/health/ready` na porta 9000 via `/dev/tcp` (sem `curl`) | 768 MB, heap até 512 MB |
+| migrate | `wallet-service migrate up` como `app_migrator`; termina | — (a app espera ele terminar com sucesso) | 128 MB |
 | app | — | `wallet-service healthcheck` | 128 MB, `GOMEMLIMIT=100MiB` |
 
 - **LocalStack fixado** na última versão Community que não exige auth token, com o
@@ -255,7 +286,7 @@ dependências saudáveis.
 - **Imagem da aplicação:** build multi-stage, binário estático, imagem final
   `distroless/static-debian13:nonroot` (cerca de 18 MB).
 
-## 11. Seções a definir
+## 12. Seções a definir
 
 | Tema | Fase |
 | --- | --- |

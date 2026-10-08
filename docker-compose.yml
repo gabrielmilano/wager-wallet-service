@@ -1,4 +1,4 @@
-# Ambiente local: PostgreSQL, LocalStack (SQS), Keycloak e a aplicação.
+# Ambiente local: PostgreSQL, LocalStack (SQS), Keycloak, migrations e a aplicação.
 #
 #   make up     sobe tudo e espera os healthchecks
 #   make clean  derruba e apaga os volumes (necessário para rodar o initdb de novo)
@@ -81,6 +81,20 @@ services:
       start_period: 20s
     mem_limit: 768m
 
+  # Aplica as migrations (como app_migrator) e termina. A app só sobe depois
+  # que ele sai com sucesso. Mesma imagem da app (ADR 0010).
+  migrate:
+    build: .
+    image: wager-wallet-service:local
+    command: ["migrate", "up"]
+    environment:
+      MIGRATIONS_DATABASE_URL: postgres://app_migrator:${APP_MIGRATOR_PASSWORD:-app_migrator}@postgres:5432/wager_wallet?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    mem_limit: 128m
+
   app:
     build: .
     image: wager-wallet-service:local
@@ -105,6 +119,8 @@ services:
     ports:
       - "8081:8081"
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       localstack:

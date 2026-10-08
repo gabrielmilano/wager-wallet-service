@@ -2,6 +2,8 @@
 
 - **Status:** aceito
 - **Data:** 2026-10-07
+- **Revisão:** 2026-10-07 (Fase 03): tratamento de erro no commit, por causa dos
+  triggers diferidos (ADR 0011).
 
 ## Contexto
 
@@ -46,9 +48,18 @@ Regras de uso:
 - **Sem I/O externo dentro de `fn`** (nada de publicar no SQS ou chamar HTTP). Efeitos
   externos saem pela outbox, depois do commit.
 - **Sem `WithinTx` aninhado.**
-- **Erro no commit é tratado como resultado desconhecido** (a conexão pode ter caído
-  depois de o servidor confirmar). Ele é classificado como falha transitória; a
-  repetição é segura porque a idempotência é persistente.
+- **Erro no commit: depende de o servidor ter respondido.**
+  - **Erro com resposta do PostgreSQL** (`*pgconn.PgError`): o resultado é
+    **conhecido**. O servidor recusou o commit e desfez a transação inteira. Isso
+    acontece, por exemplo, quando um trigger diferido (ADR 0011) encontra uma
+    invariante quebrada. É **definitivo**: repetir a mesma transação daria o mesmo erro.
+    É tratado como erro inesperado (HTTP `500`; no SQS, segue o caminho de erro
+    inesperado até a DLQ, conforme o `ARCHITECTURE.md`), nunca como falha transitória.
+  - **Erro sem resposta do servidor** (conexão caiu, timeout de rede): o resultado é
+    **desconhecido**, porque o servidor pode ter confirmado antes de a resposta se
+    perder. É classificado como falha transitória; a repetição é segura porque a
+    idempotência é persistente e a nova tentativa encontra o registro e devolve o
+    replay.
 - A ordem fixa de locks (inbox → transação → carteira) e o uso de `FOR UPDATE` são
   detalhados na Fase 05.
 
