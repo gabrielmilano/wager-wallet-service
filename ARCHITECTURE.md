@@ -280,9 +280,11 @@ concorrência: a garantia é o `UNIQUE (wallet_id, wallet_version)` somado ao
 
 ## 11. Ambiente local e testes de integração
 
-O `docker-compose.yml` sobe PostgreSQL 18.6, LocalStack 4.14.0, Keycloak 26.8.0 e a
-aplicação, todos com healthcheck e limite de memória. A aplicação só inicia depois das
-dependências saudáveis.
+O `docker-compose.yml` sobe PostgreSQL 18.6, LocalStack 4.14.0, Keycloak 26.8.0 e
+**três réplicas** da aplicação (`app`, `app-2`, `app-3`, portas 8081 a 8083), todos com
+healthcheck e limite de memória. Cada réplica é um processo independente, com conexões e
+memória próprias, executando HTTP, consumidor SQS e publisher. A aplicação só inicia
+depois das dependências saudáveis.
 
 | Serviço | Provisionamento | Healthcheck | Memória |
 | --- | --- | --- | --- |
@@ -416,7 +418,28 @@ Detalhes em [ADR 0013](docs/adr/0013-mensageria-inbox-outbox.md).
   e o evento sai de novo com o mesmo `eventId`, deduplicado) e dois publishers disputando
   a mesma outbox (cada evento enviado uma vez).
 
-## 16. Limitações e interpretações adotadas
+## 16. Testes de concorrência e falhas
+
+Rodam contra as três réplicas do Compose e o PostgreSQL, SQS e Keycloak reais
+(`make test-integration`; tabela de cenários no README):
+
+- 100.00 com duas apostas de 80.00 em instâncias diferentes: um `200`, um `422
+  INSUFFICIENT_FUNDS`, saldo 20.00 e um único débito (5 rodadas).
+- A mesma aposta 50 vezes nas três instâncias: um processamento original, 49 replays, um
+  débito.
+- 120 operações em 12 carteiras em paralelo: saldos esperados e saldo = soma do extrato.
+- A mesma operação por HTTP e SQS ao mesmo tempo: uma única movimentação.
+- Queda do consumidor depois do commit e antes de apagar: o teste age como o consumidor
+  que recebe, confirma no banco e não apaga (efeito equivalente a um `kill -9` nesse
+  ponto); o consumidor real recebe a reentrega após o visibility timeout, a inbox a
+  reconhece e a mensagem é apagada sem novo débito.
+- Outbox: publishers concorrentes, lease vencido e republicação após queda (seção 15).
+
+Esses testes encontraram três bugs reais, todos corrigidos e com teste de regressão: o
+commit concorrente entre as buscas de idempotência (seção 12), o deadlock do `FOR UPDATE`
+com o `KEY SHARE` da FK (seção 13) e o long polling cancelado no encerramento (seção 15).
+
+## 17. Limitações e interpretações adotadas
 
 Interpretações (decididas sem regra explícita no enunciado):
 
@@ -452,11 +475,10 @@ Limitações:
 - O consumidor trata as mensagens de um lote em sequência (o paralelismo vem de várias
   instâncias e de vários grupos FIFO).
 
-## 17. Seções a definir
+## 18. Seções a definir
 
 | Tema | Fase |
 | --- | --- |
 | Referências pendentes: backoff, TTL, estados da referência | 10 |
 | Reconciliação, observabilidade e health checks | 11 |
-| Testes de concorrência e falhas | 12 |
 | Trabalho não concluído (consolidado na entrega) | 13 |

@@ -36,7 +36,7 @@ Equivalente sem `make`: `docker compose up --build`.
 
 | Serviço | Endereço no host | Observação |
 | --- | --- | --- |
-| app | <http://localhost:8081> | `GET /health/live` |
+| app, app-2, app-3 | <http://localhost:8081>, `:8082`, `:8083` | três réplicas independentes (HTTP, consumidor SQS e publisher em cada uma) |
 | migrate | — | aplica as migrations e termina; a app só sobe depois dele |
 | PostgreSQL | `localhost:5432` | banco `wager_wallet`; roles `app_migrator` e `app_runtime` |
 | LocalStack (SQS) | <http://localhost:4566> | versão 4.14.0, sem auth token ([ADR 0008](docs/adr/0008-versao-do-localstack.md)) |
@@ -210,7 +210,23 @@ Hoje verificam:
 - **migrations:** `up` → `down` completo → `up` num banco temporário, sem sobras.
   Usa `POSTGRES_ADMIN_URL` (superusuário local) para criar e apagar esse banco.
 
-_Múltiplas instâncias e simulações de falha: a definir (Fase 12)._
+### Concorrência, múltiplas instâncias e falhas
+
+O `make up` já sobe **três réplicas** da aplicação, então os mesmos comandos executam os
+cenários de concorrência e falha (fazem parte de `make test-integration`):
+
+| Cenário | Teste |
+| --- | --- |
+| 100.00 com duas apostas de 80.00 em instâncias diferentes, ao mesmo tempo | `TestMultiInstanceTwoBetsOf80On100` |
+| A mesma aposta 50 vezes em paralelo nas três instâncias | `TestMultiInstanceSameBetFiftyTimes` |
+| Carteiras diferentes em paralelo, com conferência saldo × extrato | `TestMultiInstanceManyWalletsInParallel` |
+| A mesma operação por HTTP e por SQS ao mesmo tempo | `TestMultiInstanceHTTPAndSQSSameOperation` |
+| Queda do consumidor depois do commit e antes de apagar a mensagem | `TestConsumerCrashAfterCommitBeforeDelete` |
+| Publishers concorrentes, lease vencido, republicação após queda | `TestOutbox*` |
+| Reversão antes da referência (espera) | `TestReversalBeforeReferenceWaits` |
+
+Para rodar só esses: `go test -race -count=1 -tags=integration -run 'MultiInstance|Crash|Outbox|Concurrent' ./test/integration/`.
+As URLs das réplicas podem ser trocadas com `APP_INSTANCE_URLS` (separadas por vírgula).
 
 ## Arquitetura
 
