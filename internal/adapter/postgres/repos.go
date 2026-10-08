@@ -55,8 +55,15 @@ func (r *walletRepo) Get(ctx context.Context, id uuid.UUID) (*wallet.Wallet, err
 
 // GetForUpdate é a fila por carteira: outra transação que peça o mesmo lock
 // espera esta terminar (até o lock_timeout).
+//
+// FOR NO KEY UPDATE, e não FOR UPDATE: o INSERT da operação, antes deste
+// SELECT, pega um lock FOR KEY SHARE implícito na carteira por causa da FK.
+// FOR UPDATE conflita com KEY SHARE, então duas operações concorrentes (cada
+// uma com seu KEY SHARE) esperavam uma pela outra: deadlock. FOR NO KEY
+// UPDATE não conflita com KEY SHARE e continua serializando quem disputa a
+// carteira; é o mesmo lock que o UPDATE do saldo pega (nenhuma chave muda).
 func (r *walletRepo) GetForUpdate(ctx context.Context, id uuid.UUID) (*wallet.Wallet, error) {
-	return scanWallet(r.q.QueryRow(ctx, `SELECT `+walletColumns+` FROM wallets WHERE id = $1 FOR UPDATE`, id))
+	return scanWallet(r.q.QueryRow(ctx, `SELECT `+walletColumns+` FROM wallets WHERE id = $1 FOR NO KEY UPDATE`, id))
 }
 
 // UpdateBalance confere a versão anterior no WHERE: se alguém tivesse mudado
@@ -302,6 +309,17 @@ func (r *ledgerRepo) List(ctx context.Context, walletID uuid.UUID, afterVersion 
 	return out, translate(rows.Err())
 }
 
+func (r *ledgerRepo) Totals(ctx context.Context, walletID uuid.UUID) (int64, int64, int, error) {
+	var credits, debits int64
+	var entries int
+	err := r.q.QueryRow(ctx,
+		`SELECT COALESCE(SUM(amount_minor) FILTER (WHERE direction = 'CREDIT'), 0)::bigint,
+		        COALESCE(SUM(amount_minor) FILTER (WHERE direction = 'DEBIT'), 0)::bigint,
+		        COUNT(*)
+		   FROM wallet_ledger_entries WHERE wallet_id = $1`, walletID).Scan(&credits, &debits, &entries)
+	return credits, debits, entries, translate(err)
+}
+
 // --- inbox_messages ----------------------------------------------------------
 
 type inboxRepo struct{ q querier }
@@ -362,19 +380,23 @@ func (r *outboxRepo) Insert(ctx context.Context, events ...event.Envelope) error
 // concorrentes pegam lotes diferentes; o lease (locked_until) devolve à fila
 // o lote de um publisher que caiu.
 func (r *outboxRepo) Claim(ctx context.Context, owner string, now, leaseUntil time.Time, limit int) ([]store.OutboxEvent, error) {
+	// UPDATE ... RETURNING não garante ordem: a CTE reordena o lote, para
+	// que os eventos de uma carteira saiam na ordem em que foram gravados.
 	rows, err := r.q.Query(ctx,
-		`UPDATE outbox_events
-		    SET locked_by = $1, locked_until = $3, attempts = attempts + 1
-		  WHERE event_id IN (
-		        SELECT event_id FROM outbox_events
-		         WHERE published_at IS NULL
-		           AND next_attempt_at <= $2
-		           AND (locked_until IS NULL OR locked_until < $2)
-		         ORDER BY occurred_at, event_id
-		         LIMIT $4
-		         FOR UPDATE SKIP LOCKED)
-		 RETURNING event_id, aggregate_id, event_type, event_version, correlation_id,
-		           causation_id, payload, occurred_at, attempts`,
+		`WITH claimed AS (
+		     UPDATE outbox_events
+		        SET locked_by = $1, locked_until = $3, attempts = attempts + 1
+		      WHERE event_id IN (
+		            SELECT event_id FROM outbox_events
+		             WHERE published_at IS NULL
+		               AND next_attempt_at <= $2
+		               AND (locked_until IS NULL OR locked_until < $2)
+		             ORDER BY occurred_at, event_id
+		             LIMIT $4
+		             FOR UPDATE SKIP LOCKED)
+		     RETURNING event_id, aggregate_id, event_type, event_version, correlation_id,
+		               causation_id, payload, occurred_at, attempts)
+		 SELECT * FROM claimed ORDER BY occurred_at, event_id`,
 		owner, now, leaseUntil, limit)
 	if err != nil {
 		return nil, translate(err)
@@ -422,4 +444,12 @@ func (r *outboxRepo) MarkFailed(ctx context.Context, eventID uuid.UUID, owner st
 		return fmt.Errorf("%w: evento %s não está reservado por %s", store.ErrNotFound, eventID, owner)
 	}
 	return nil
+}
+
+func (r *outboxRepo) Backlog(ctx context.Context) (int, *time.Time, error) {
+	var pending int
+	var oldest *time.Time
+	err := r.q.QueryRow(ctx,
+		`SELECT COUNT(*), MIN(occurred_at) FROM outbox_events WHERE published_at IS NULL`).Scan(&pending, &oldest)
+	return pending, oldest, translate(err)
 }

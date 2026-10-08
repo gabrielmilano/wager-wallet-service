@@ -39,6 +39,31 @@ func NewTxRunner(pool *pgxpool.Pool, lockTimeout time.Duration) *TxRunner {
 	return &TxRunner{pool: pool, lockTimeout: lockTimeout}
 }
 
+// ReadSnapshot abre uma transação REPEATABLE READ READ ONLY: todas as
+// leituras de fn veem o mesmo snapshot (usado na reconciliação).
+func (r *TxRunner) ReadSnapshot(ctx context.Context, fn func(ctx context.Context, repos store.Repos) error) error {
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return translate(err)
+	}
+	defer func() {
+		rbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_ = tx.Rollback(rbCtx)
+	}()
+	repos := store.Repos{
+		Wallets: &walletRepo{q: tx}, Transactions: &transactionRepo{q: tx}, Ledger: &ledgerRepo{q: tx},
+		Inbox: &inboxRepo{q: tx}, Outbox: &outboxRepo{q: tx},
+	}
+	if err := fn(ctx, repos); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return translateCommit(err)
+	}
+	return nil
+}
+
 // WithinTx abre a transação, aplica o lock_timeout, entrega os repositórios
 // ligados a ela e faz commit se fn devolver nil (rollback caso contrário).
 func (r *TxRunner) WithinTx(ctx context.Context, fn func(ctx context.Context, repos store.Repos) error) error {

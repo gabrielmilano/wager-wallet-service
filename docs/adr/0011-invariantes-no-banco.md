@@ -76,7 +76,7 @@ confirmar, e as duas passariam na verificação. A garantia real vem de:
 
 - `UNIQUE (wallet_id, wallet_version)`: só uma das duas consegue gravar aquela versão; a
   outra falha com `23505`;
-- `SELECT ... FOR UPDATE` na carteira (Fase 05): a segunda transação espera a primeira
+- `SELECT ... FOR NO KEY UPDATE` na carteira (Fase 05): a segunda transação espera a primeira
   terminar e então lê o estado já atualizado.
 
 O trigger acrescenta a verificação de conteúdo (o "antes" é o "depois" anterior), que o

@@ -21,6 +21,13 @@ import (
 // com os padrões locais do .env.example e a porta HTTP efêmera.
 func appConfig(t *testing.T, overrides map[string]string) config.Config {
 	t.Helper()
+	// O SDK da AWS lê as credenciais do ambiente (cadeia padrão); no Compose
+	// elas vêm do docker-compose.yml.
+	for k, def := range map[string]string{"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"} {
+		if env(k, "") == "" {
+			t.Setenv(k, def)
+		}
+	}
 	defaults := map[string]string{
 		"APP_HTTP_ADDR":         "127.0.0.1:0",
 		"APP_INSTANCE_ID":       "integration",
@@ -55,8 +62,10 @@ func appConfig(t *testing.T, overrides map[string]string) config.Config {
 
 var quietLogger = fx.Decorate(func() *slog.Logger { return slog.New(slog.DiscardHandler) })
 
-// TestAppStartsAndStops sobe a composição Fx real, confere que HTTP e banco
-// respondem e que, depois do Stop, a porta e o pool foram liberados.
+// TestAppStartsAndStops sobe a composição Fx real (HTTP, consumidor SQS e
+// publisher da outbox), confere que HTTP e banco respondem e que, depois do
+// Stop, os workers terminaram (o Stop falha se não terminarem no prazo) e a
+// porta e o pool foram liberados.
 func TestAppStartsAndStops(t *testing.T) {
 	var srv *httpapi.Server
 	var pool *pgxpool.Pool

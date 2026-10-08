@@ -1,4 +1,5 @@
-# Ambiente local: PostgreSQL, LocalStack (SQS), Keycloak, migrations e a aplicação.
+# Ambiente local: PostgreSQL, LocalStack (SQS), Keycloak, migrations e três réplicas
+# da aplicação (portas 8081, 8082 e 8083).
 #
 #   make up     sobe tudo e espera os healthchecks
 #   make clean  derruba e apaga os volumes (necessário para rodar o initdb de novo)
@@ -7,6 +8,48 @@
 # As senhas e secrets aqui são apenas para desenvolvimento local.
 
 name: wager-wallet
+
+# Definição comum das réplicas da aplicação (âncora YAML).
+x-app: &app
+  build: .
+  image: wager-wallet-service:local
+  environment: &app-env
+    APP_HTTP_ADDR: :8081
+    APP_SHUTDOWN_TIMEOUT: 20s
+    LOG_LEVEL: ${LOG_LEVEL:-info}
+    GOMEMLIMIT: 100MiB
+    DATABASE_URL: postgres://app_runtime:${APP_RUNTIME_PASSWORD:-app_runtime}@postgres:5432/wager_wallet?sslmode=disable
+    DB_LOCK_TIMEOUT: 3s
+    AWS_REGION: ${AWS_REGION:-us-east-1}
+    AWS_ACCESS_KEY_ID: test
+    AWS_SECRET_ACCESS_KEY: test
+    AWS_ENDPOINT_URL: http://localstack:4566
+    SQS_INPUT_QUEUE_NAME: ${SQS_INPUT_QUEUE_NAME:-wager-transactions.fifo}
+    SQS_INPUT_DLQ_NAME: ${SQS_INPUT_DLQ_NAME:-wager-transactions-dlq.fifo}
+    SQS_EVENTS_QUEUE_NAME: ${SQS_EVENTS_QUEUE_NAME:-wallet-events.fifo}
+    # iss esperado (texto) e chaves buscadas direto na rede interna (ADR 0009).
+    OIDC_ISSUER_URL: http://localhost:8180/realms/wager
+    OIDC_JWKS_URL: http://keycloak:8080/realms/wager/protocol/openid-connect/certs
+    OIDC_AUDIENCE: wager-wallet-service
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    postgres:
+      condition: service_healthy
+    localstack:
+      condition: service_healthy
+    keycloak:
+      condition: service_healthy
+  healthcheck:
+    # Distroless não tem curl nem shell: o próprio binário faz a checagem.
+    test: ["CMD", "/wallet-service", "healthcheck"]
+    interval: 5s
+    timeout: 3s
+    retries: 6
+  # Maior que APP_SHUTDOWN_TIMEOUT, para o Docker não matar o processo
+  # antes de o Fx terminar o encerramento.
+  stop_grace_period: 30s
+  mem_limit: 128m
 
 services:
   postgres:
@@ -42,7 +85,7 @@ services:
     ports:
       - "4566:4566"
     volumes:
-      - ./deploy/localstack/init/ready.d:/etc/localstack/init/ready.d:ro
+      - ./deploy/localstack/init:/etc/localstack/init:ro
     healthcheck:
       # Arquivo criado pelo script de filas somente se tudo deu certo.
       test: ["CMD", "test", "-f", "/tmp/queues-ready"]
@@ -95,48 +138,31 @@ services:
     restart: "no"
     mem_limit: 128m
 
+  # Três réplicas independentes (processos, conexões e memória próprios):
+  # a coordenação entre elas é toda feita no PostgreSQL e no SQS.
   app:
-    build: .
-    image: wager-wallet-service:local
+    <<: *app
     environment:
-      APP_HTTP_ADDR: :8081
-      APP_SHUTDOWN_TIMEOUT: 20s
-      LOG_LEVEL: ${LOG_LEVEL:-info}
-      GOMEMLIMIT: 100MiB
-      DATABASE_URL: postgres://app_runtime:${APP_RUNTIME_PASSWORD:-app_runtime}@postgres:5432/wager_wallet?sslmode=disable
-      DB_LOCK_TIMEOUT: 3s
-      AWS_REGION: ${AWS_REGION:-us-east-1}
-      AWS_ACCESS_KEY_ID: test
-      AWS_SECRET_ACCESS_KEY: test
-      AWS_ENDPOINT_URL: http://localstack:4566
-      SQS_INPUT_QUEUE_NAME: ${SQS_INPUT_QUEUE_NAME:-wager-transactions.fifo}
-      SQS_INPUT_DLQ_NAME: ${SQS_INPUT_DLQ_NAME:-wager-transactions-dlq.fifo}
-      SQS_EVENTS_QUEUE_NAME: ${SQS_EVENTS_QUEUE_NAME:-wallet-events.fifo}
-      # iss esperado (texto) e chaves buscadas direto na rede interna (ADR 0009).
-      OIDC_ISSUER_URL: http://localhost:8180/realms/wager
-      OIDC_JWKS_URL: http://keycloak:8080/realms/wager/protocol/openid-connect/certs
-      OIDC_AUDIENCE: wager-wallet-service
+      <<: *app-env
+      APP_INSTANCE_ID: app-1
     ports:
       - "8081:8081"
-    depends_on:
-      migrate:
-        condition: service_completed_successfully
-      postgres:
-        condition: service_healthy
-      localstack:
-        condition: service_healthy
-      keycloak:
-        condition: service_healthy
-    healthcheck:
-      # Distroless não tem curl nem shell: o próprio binário faz a checagem.
-      test: ["CMD", "/wallet-service", "healthcheck"]
-      interval: 5s
-      timeout: 3s
-      retries: 6
-    # Maior que APP_SHUTDOWN_TIMEOUT, para o Docker não matar o processo
-    # antes de o Fx terminar o encerramento.
-    stop_grace_period: 30s
-    mem_limit: 128m
+
+  app-2:
+    <<: *app
+    environment:
+      <<: *app-env
+      APP_INSTANCE_ID: app-2
+    ports:
+      - "8082:8081"
+
+  app-3:
+    <<: *app
+    environment:
+      <<: *app-env
+      APP_INSTANCE_ID: app-3
+    ports:
+      - "8083:8081"
 
 volumes:
   pgdata:

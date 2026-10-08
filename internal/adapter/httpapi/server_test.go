@@ -17,7 +17,7 @@ func discardLogger() *slog.Logger {
 
 func TestLive(t *testing.T) {
 	rec := httptest.NewRecorder()
-	NewRouter().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health/live", nil))
+	NewRouter(Deps{}).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health/live", nil))
 
 	if rec.Code != http.StatusOK {
 		t.Errorf("status = %d, want 200", rec.Code)
@@ -29,7 +29,7 @@ func TestLive(t *testing.T) {
 
 func TestLiveRejectsOtherMethods(t *testing.T) {
 	rec := httptest.NewRecorder()
-	NewRouter().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/health/live", nil))
+	NewRouter(Deps{}).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/health/live", nil))
 
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("status = %d, want 405", rec.Code)
@@ -40,7 +40,7 @@ func TestServerStartProbeStop(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	srv := NewServer("127.0.0.1:0", NewRouter(), discardLogger(), func(err error) {
+	srv := NewServer("127.0.0.1:0", NewRouter(Deps{}), discardLogger(), func(err error) {
 		t.Errorf("onError chamado: %v", err)
 	})
 	if err := srv.Start(ctx); err != nil {
@@ -66,7 +66,7 @@ func TestServerStartFailsWhenPortIsTaken(t *testing.T) {
 	}
 	defer ln.Close()
 
-	srv := NewServer(ln.Addr().String(), NewRouter(), discardLogger(), func(error) {})
+	srv := NewServer(ln.Addr().String(), NewRouter(Deps{}), discardLogger(), func(error) {})
 	if err := srv.Start(context.Background()); err == nil {
 		t.Error("Start em porta ocupada: esperado erro, veio nil")
 	}
@@ -86,7 +86,7 @@ func TestProbeRejectsNon200(t *testing.T) {
 }
 
 func TestProbeRewritesWildcardHost(t *testing.T) {
-	srv := NewServer("127.0.0.1:0", NewRouter(), discardLogger(), func(error) {})
+	srv := NewServer("127.0.0.1:0", NewRouter(Deps{}), discardLogger(), func(error) {})
 	if err := srv.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}

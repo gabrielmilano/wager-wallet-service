@@ -28,6 +28,9 @@ var (
 // Dentro de fn não há I/O externo.
 type TxRunner interface {
 	WithinTx(ctx context.Context, fn func(ctx context.Context, r Repos) error) error
+	// ReadSnapshot executa fn numa transação REPEATABLE READ READ ONLY: todas
+	// as leituras veem a mesma foto do banco, sem bloquear quem grava.
+	ReadSnapshot(ctx context.Context, fn func(ctx context.Context, r Repos) error) error
 }
 
 // Repos são os repositórios ligados a uma mesma transação.
@@ -44,7 +47,7 @@ type WalletRepository interface {
 	Insert(ctx context.Context, w *wallet.Wallet) error
 	// Get lê sem lock; ErrNotFound se não existe.
 	Get(ctx context.Context, id uuid.UUID) (*wallet.Wallet, error)
-	// GetForUpdate lê com SELECT ... FOR UPDATE: a fila por carteira.
+	// GetForUpdate lê com lock de linha (FOR NO KEY UPDATE): a fila por carteira.
 	GetForUpdate(ctx context.Context, id uuid.UUID) (*wallet.Wallet, error)
 	// UpdateBalance grava saldo e versão; confere que a versão gravada é a
 	// anterior (proteção extra contra lost update, além do lock).
@@ -77,6 +80,8 @@ type LedgerRepository interface {
 	// List devolve até limit lançamentos com versão > afterVersion, em ordem
 	// crescente de versão (ordenação estável para a paginação).
 	List(ctx context.Context, walletID uuid.UUID, afterVersion int64, limit int) ([]wallet.LedgerEntry, error)
+	// Totals soma créditos e débitos (unidades mínimas) e conta os lançamentos.
+	Totals(ctx context.Context, walletID uuid.UUID) (credits, debits int64, entries int, err error)
 }
 
 // InboxMessage é o registro de uma mensagem recebida pelo consumidor.
@@ -112,4 +117,7 @@ type OutboxRepository interface {
 	MarkPublished(ctx context.Context, eventID uuid.UUID, owner string, at time.Time) error
 	// MarkFailed libera o lease e agenda a próxima tentativa (backoff).
 	MarkFailed(ctx context.Context, eventID uuid.UUID, owner string, nextAttempt time.Time, lastError string) error
+	// Backlog devolve quantos eventos faltam publicar e o occurred_at do mais
+	// antigo (nil se não houver).
+	Backlog(ctx context.Context) (pending int, oldest *time.Time, err error)
 }

@@ -30,6 +30,11 @@ func NewServer(addr string, h http.Handler, log *slog.Logger, onError func(error
 			Addr:              addr,
 			Handler:           h,
 			ReadHeaderTimeout: 5 * time.Second,
+			// Maiores que o prazo de cada requisição (10 s), que inclui o
+			// lock_timeout do banco.
+			ReadTimeout:  15 * time.Second,
+			WriteTimeout: 20 * time.Second,
+			IdleTimeout:  60 * time.Second,
 		},
 		log:     log,
 		onError: onError,

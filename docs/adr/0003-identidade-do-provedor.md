@@ -28,9 +28,9 @@ consumidor. O IdP recomendado é o Keycloak, com `client_credentials`.
   `realm_access.roles`, que é onde a aplicação as lê.
 - O middleware HTTP coloca um `Principal{ProviderID, Roles}` no `context.Context`. Se o
   corpo trouxer um `providerId` diferente do token → `403 PROVIDER_FORBIDDEN`, sem gravar
-  nada. Consultas por transação filtram pelo `providerId` do token. *Proposta, a
-  confirmar na Fase 07:* uma transação de outro provedor responde como inexistente
-  (`404`), para não revelar sua existência.
+  nada. Consultas por transação filtram pelo `providerId` do token: uma transação de
+  outro provedor responde como inexistente (`404`), para não revelar sua existência
+  (aprovado; implementado no bloco C).
 
 ### SQS
 

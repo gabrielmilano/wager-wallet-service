@@ -5,22 +5,51 @@ jogos (`BET`, `WIN`, `LOSS`, `REFUND`, `ROLLBACK`), recebidas por HTTP e por SQS
 ledger append-only, idempotência persistente, transactional outbox e coordenação por
 carteira entre múltiplas instâncias.
 
-> Em construção. As seções abaixo serão preenchidas ao longo das fases.
+Principais garantias (detalhes em [ARCHITECTURE.md](ARCHITECTURE.md)):
+
+- **Dinheiro sem ponto flutuante:** `int64` em centavos, parsing estrito e overflow
+  verificado; `{"amount":"25.00","currency":"BRL"}` no contrato.
+- **O banco é a última linha de defesa:** saldo não negativo, extrato append-only,
+  unicidades, máquina de estados e "saldo = extrato" impostos por constraints, permissões
+  e triggers.
+- **Idempotência persistente:** chave por provedor e hash canônico do conteúdo; replay
+  devolve o resultado original; HTTP e SQS compartilham o mesmo caso de uso.
+- **Concorrência por carteira** com lock de linha no PostgreSQL, sem lock global;
+  testado com três instâncias independentes.
+- **Inbox e transactional outbox:** nenhuma movimentação duplicada nem evento perdido em
+  quedas antes ou depois do commit.
+- **Autenticação OIDC (Keycloak)** com o `providerId` vindo do token e isolamento entre
+  provedores.
 
 ## Pré-requisitos
 
 - Go 1.27.x (com cgo/gcc para `go test -race`)
 - Docker e Docker Compose v2
 - `make`
-- Cerca de 1,7 GB de memória livre para os containers (limites: Keycloak 768 MB,
-  LocalStack 512 MB, PostgreSQL 256 MB, app 128 MB)
-- Portas livres: `5432` (PostgreSQL), `4566` (LocalStack), `8180` (Keycloak), `8081` (app)
+- Cerca de 2 GB de memória livre para os containers (limites: Keycloak 768 MB,
+  LocalStack 512 MB, PostgreSQL 256 MB e 128 MB por réplica da app)
+- Portas livres: `5432` (PostgreSQL), `4566` (LocalStack), `8180` (Keycloak), `8081`,
+  `8082` e `8083` (as três réplicas da app)
 
 ## Variáveis de ambiente
 
 Veja [.env.example](.env.example). O `.env` é **opcional**: o `docker-compose.yml` e os
 testes de integração usam padrões iguais aos do exemplo. Copie para `.env` para rodar a
-aplicação fora do Docker ou para trocar senhas.
+aplicação fora do Docker ou para trocar senhas. As principais:
+
+| Variável | Padrão | Uso |
+| --- | --- | --- |
+| `APP_HTTP_ADDR` | `:8081` | endereço HTTP |
+| `APP_INSTANCE_ID` | hostname | identifica a instância nos logs e no lease da outbox |
+| `APP_ENABLE_HTTP`, `APP_ENABLE_SQS_CONSUMER`, `APP_ENABLE_OUTBOX_PUBLISHER`, `APP_ENABLE_PENDING_WORKER` | `true` | liga/desliga cada componente ([ADR 0002](docs/adr/0002-binario-unico.md)) |
+| `APP_SHUTDOWN_TIMEOUT` | `20s` | prazo do encerramento gracioso |
+| `DATABASE_URL` | — | PostgreSQL como `app_runtime` |
+| `MIGRATIONS_DATABASE_URL` | — | PostgreSQL como `app_migrator` (só `migrate`) |
+| `DB_LOCK_TIMEOUT` | `3s` | espera máxima pelo lock da carteira (depois: 503 / retry) |
+| `DB_MAX_CONNS` | `10` | conexões por instância |
+| `AWS_REGION`, `AWS_ENDPOINT_URL`, `SQS_*_NAME` | LocalStack | SQS |
+| `OIDC_ISSUER_URL`, `OIDC_JWKS_URL`, `OIDC_AUDIENCE` | Keycloak local | validação dos tokens ([ADR 0009](docs/adr/0009-validacao-oidc-sem-discovery.md)) |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 
 ## Execução
 
@@ -36,7 +65,7 @@ Equivalente sem `make`: `docker compose up --build`.
 
 | Serviço | Endereço no host | Observação |
 | --- | --- | --- |
-| app | <http://localhost:8081> | `GET /health/live` |
+| app, app-2, app-3 | <http://localhost:8081>, `:8082`, `:8083` | três réplicas independentes (HTTP, consumidor SQS e publisher em cada uma) |
 | migrate | — | aplica as migrations e termina; a app só sobe depois dele |
 | PostgreSQL | `localhost:5432` | banco `wager_wallet`; roles `app_migrator` e `app_runtime` |
 | LocalStack (SQS) | <http://localhost:4566> | versão 4.14.0, sem auth token ([ADR 0008](docs/adr/0008-versao-do-localstack.md)) |
@@ -103,12 +132,28 @@ As filas são criadas automaticamente quando o LocalStack fica pronto, pelo scri
 | `wallet-events.fifo` | eventos publicados pela outbox | — |
 
 Todas são FIFO, sem deduplicação por conteúdo (quem envia informa o
-`MessageDeduplicationId`). Os valores de visibility timeout e tentativas são revistos na
-Fase 08. Para listar as filas:
+`MessageDeduplicationId`). Contrato de entrada: `MessageGroupId = walletId` e
+`MessageDeduplicationId = messageId` do envelope. Para listar as filas e enviar uma
+operação pela fila (usando `$PLAYER` e `$WALLET` dos exemplos abaixo):
 
 ```sh
 docker compose exec localstack awslocal sqs list-queues
+
+docker compose exec localstack awslocal sqs send-message \
+  --queue-url http://localhost:4566/000000000000/wager-transactions.fifo \
+  --message-group-id "$WALLET" --message-deduplication-id msg-123 \
+  --message-body '{"messageId":"msg-123","type":"WagerTransactionRequested","occurredAt":"2026-09-08T12:00:00.000Z",
+    "data":{"providerId":"provider-a","externalTransactionId":"transaction-456","idempotencyKey":"provider-a:transaction-456",
+    "playerId":"'$PLAYER'","walletId":"'$WALLET'","roundId":"round-987","gameId":"fortune-chimp",
+    "kind":"BET","money":{"amount":"10.00","currency":"BRL"}}}'
+
+# Eventos publicados pela outbox:
+docker compose exec localstack awslocal sqs receive-message \
+  --queue-url http://localhost:4566/000000000000/wallet-events.fifo --max-number-of-messages 10
 ```
+
+Erros permanentes (mensagem inválida, carteira inexistente etc.) vão para
+`wager-transactions-dlq.fifo` com os atributos `failureCode` e `failureReason`.
 
 As políticas IAM que controlariam o acesso na AWS real estão em
 [deploy/aws/iam-policies.md](deploy/aws/iam-policies.md); o LocalStack Community não
@@ -136,11 +181,62 @@ TOKEN=$(curl -s http://localhost:8180/realms/wager/protocol/openid-connect/token
   -d client_secret=provider-a-secret | jq -r .access_token)   # requer jq
 ```
 
-A validação dos tokens pela aplicação entra na Fase 07.
+Os tokens valem 5 minutos (o client `provider-a-short`, só para testes, emite tokens de
+1 segundo). A aplicação valida assinatura, `iss`, `aud` e `exp` (ADR 0009) e lê as roles
+de realm (`provider`, `wallet-admin`) e o claim `provider_id`.
+
+> Mudanças no realm exigem recriar o container do Keycloak (`make clean` ou
+> `docker compose rm -sf keycloak && make up`): o import ignora realms existentes.
 
 ## Exemplos de chamadas
 
-_A definir._
+Com o ambiente no ar (`make up`) e `jq` instalado:
+
+```sh
+KC=http://localhost:8180/realms/wager/protocol/openid-connect/token
+token() { curl -s $KC -d grant_type=client_credentials -d client_id=$1 -d client_secret=$1-secret | jq -r .access_token; }
+ADMIN=$(token wallet-internal)
+PROVIDER=$(token provider-a)
+PLAYER=$(uuidgen | tr A-Z a-z)
+
+# Abrir carteira (serviço interno) -> 201
+WALLET=$(curl -s -X POST localhost:8081/wallets -H "Authorization: Bearer $ADMIN" \
+  -H 'Content-Type: application/json' \
+  -d '{"playerId":"'$PLAYER'","initialBalance":{"amount":"1000.00","currency":"BRL"}}' | jq -r .id)
+
+# Aposta (provedor) -> 200; repetir o mesmo comando -> 200 com idempotentReplay: true
+curl -s -X POST localhost:8081/wagering/transactions -H "Authorization: Bearer $PROVIDER" \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: provider-a:transaction-123' \
+  -d '{"providerId":"provider-a","externalTransactionId":"transaction-123","playerId":"'$PLAYER'",
+       "walletId":"'$WALLET'","roundId":"round-987","gameId":"fortune-chimp","kind":"BET",
+       "money":{"amount":"25.00","currency":"BRL"}}' | jq
+
+# Consultas
+curl -s localhost:8081/wallets/$WALLET -H "Authorization: Bearer $ADMIN" | jq
+curl -s -X POST localhost:8081/wallets/$WALLET/reconciliation -H "Authorization: Bearer $ADMIN" | jq
+curl -s "localhost:8081/wallets/$WALLET/ledger?limit=50" -H "Authorization: Bearer $ADMIN" | jq
+curl -s localhost:8081/providers/provider-a/wagering/transactions/transaction-123 \
+  -H "Authorization: Bearer $PROVIDER" | jq
+```
+
+Status: `200` processado, `202` aguardando referência, `422` rejeitado (com
+`failureCode`), `400` entrada inválida, `401` sem token válido, `403` sem permissão,
+`404` inexistente, `409` conflito de idempotência, `503` indisponível (com
+`Retry-After`). Detalhes em [ARCHITECTURE.md](ARCHITECTURE.md#8-classificação-de-erros).
+
+## Observabilidade
+
+- **Logs** em JSON (`log/slog`) com `service`, `instanceId` e, quando houver,
+  `correlationId` (header `X-Correlation-Id`, devolvido na resposta), `messageId`,
+  `transactionId`, `walletId` e `providerId`. Sem tokens, credenciais nem payloads.
+- **Health checks públicos:** `GET /health/live` (processo) e `GET /health/ready`
+  (PostgreSQL e SQS; `503` se algum falhar).
+- **Métricas Prometheus** em `GET /metrics`: `wager_operations_total` (por origem, tipo e
+  estado), `wager_idempotent_replays_total`, `wager_processing_seconds`,
+  `wager_conflicts_total` (idempotência, lock_timeout, deadlock), `sqs_messages_total`
+  (processed, dead_letter, retry, released), `outbox_events_published_total`,
+  `outbox_publish_failures_total`, `outbox_pending_events`, `outbox_lag_seconds`,
+  `wallet_reconciliations_total{consistent}` e `wager_pending_reference_retries_total`.
 
 ## Testes
 
@@ -162,7 +258,7 @@ make up
 make test-integration   # go test -race -count=1 -tags=integration ./...
 ```
 
-Hoje verificam:
+Verificam:
 
 - **infraestrutura:** roles do PostgreSQL, filas e redrive, tokens do Keycloak e liveness;
 - **schema** ([ADR 0011](docs/adr/0011-invariantes-no-banco.md)): o banco recusa saldo
@@ -172,13 +268,43 @@ Hoje verificam:
   operação, e saldo divergente do extrato no commit. Cada caso confere o SQLSTATE e o
   nome da constraint;
 - **migrations:** `up` → `down` completo → `up` num banco temporário, sem sobras.
-  Usa `POSTGRES_ADMIN_URL` (superusuário local) para criar e apagar esse banco.
+  Usa `POSTGRES_ADMIN_URL` (superusuário local) para criar e apagar esse banco;
+- **casos de uso:** abertura, os cinco tipos externos, idempotência e replay, reversões e
+  todas as rejeições de referência, inbox, `lock_timeout`, paginação e composição Fx
+  (início, encerramento dos workers e liberação de recursos);
+- **HTTP + Keycloak:** token ausente, malformado, adulterado e expirado, matriz de roles,
+  isolamento entre provedores e contrato de status;
+- **SQS:** deduplicação pela inbox, DLQ e publisher da outbox (concorrência, lease,
+  republicação e backoff);
+- **worker de pendências, reconciliação, readiness e métricas.**
 
-_Múltiplas instâncias e simulações de falha: a definir (Fase 12)._
+### Concorrência, múltiplas instâncias e falhas
+
+O `make up` já sobe **três réplicas** da aplicação, então os mesmos comandos executam os
+cenários de concorrência e falha (fazem parte de `make test-integration`):
+
+| Cenário | Teste |
+| --- | --- |
+| 100.00 com duas apostas de 80.00 em instâncias diferentes, ao mesmo tempo | `TestMultiInstanceTwoBetsOf80On100` |
+| A mesma aposta 50 vezes em paralelo nas três instâncias | `TestMultiInstanceSameBetFiftyTimes` |
+| Carteiras diferentes em paralelo, com conferência saldo × extrato | `TestMultiInstanceManyWalletsInParallel` |
+| A mesma operação por HTTP e por SQS ao mesmo tempo | `TestMultiInstanceHTTPAndSQSSameOperation` |
+| Queda do consumidor depois do commit e antes de apagar a mensagem | `TestConsumerCrashAfterCommitBeforeDelete` |
+| Publishers concorrentes, lease vencido, republicação após queda | `TestOutbox*` |
+| Reversão antes da referência: resolvida quando ela chega, ou expirada | `TestPendingReference*` |
+| Reinício das três réplicas (idempotência, pendências e saldo preservados) | `make test-restart` |
+
+Para rodar só esses: `go test -race -count=1 -tags=integration -run 'MultiInstance|Crash|Outbox|Concurrent' ./test/integration/`.
+As URLs das réplicas podem ser trocadas com `APP_INSTANCE_URLS` (separadas por vírgula).
+
+`make test-restart` usa a tag `restart` (além de `integration`) porque reinicia os
+containers das réplicas com `docker compose restart`.
 
 ## Arquitetura
 
 Decisões técnicas em [ARCHITECTURE.md](ARCHITECTURE.md) e nos ADRs em [docs/adr/](docs/adr/).
+Limitações, simplificações e trabalho não concluído estão nas seções finais do
+`ARCHITECTURE.md`.
 
 ## Uso de IA
 

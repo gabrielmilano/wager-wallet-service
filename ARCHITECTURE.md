@@ -1,8 +1,8 @@
 # Arquitetura
 
 Este documento registra as decisões técnicas do `wager-wallet-service`. Os detalhes e as
-alternativas de cada decisão estão nos ADRs em [docs/adr/](docs/adr/). Seções marcadas
-como *a definir* serão preenchidas nas fases indicadas.
+alternativas de cada decisão estão nos ADRs em [docs/adr/](docs/adr/). As seções finais
+listam limitações, interpretações adotadas e o que não foi concluído.
 
 ## 1. Visão geral
 
@@ -16,9 +16,9 @@ por variável de ambiente ([ADR 0002](docs/adr/0002-binario-unico.md)):
 | Publisher da outbox | Publica em `wallet-events.fifo` os eventos já confirmados no banco |
 | Worker de referências pendentes | Retoma operações em `PENDING_REFERENCE` com backoff |
 
-Várias instâncias do mesmo binário rodam em paralelo. Toda a coordenação entre elas
-acontece no PostgreSQL (locks por linha, `SKIP LOCKED`, constraints e triggers). Nenhuma
-instância guarda estado que outra precise.
+Várias instâncias do mesmo binário rodam em paralelo (o Compose sobe três réplicas).
+Toda a coordenação entre elas acontece no PostgreSQL (locks por linha, `SKIP LOCKED`,
+constraints e triggers) e no SQS. Nenhuma instância guarda estado que outra precise.
 
 ## 2. Camadas e regra de dependência
 
@@ -107,11 +107,17 @@ docs/adr/                Architecture Decision Records
   aplicação inteira encerra com código 1 (`fx.Shutdowner`).
 - `wallet-service healthcheck` chama `/health/live` da própria instância; é o
   healthcheck do container, já que a imagem distroless não tem `curl`.
-- Testes: `fx.ValidateApp` para cada combinação de componentes e `fxtest` para início,
-  resposta HTTP e liberação da porta após o encerramento.
-
-*A definir (Fases 07 a 10):* prazos de shutdown por componente, término observável
-dos workers e teste com `fxtest` comprovando a liberação de recursos dos workers.
+- **Workers** (consumidor SQS, publisher da outbox, worker de pendências) rodam em
+  goroutines com contexto próprio. O `OnStop` cancela o contexto e espera a goroutine
+  terminar; se o prazo do Fx acabar antes, devolve erro (término observável). Ao
+  encerrar: o consumidor não pega mensagens novas, termina a que está em andamento e
+  devolve a visibilidade das demais; o publisher libera o resto do lote; o worker de
+  pendências termina a pendência atual (uma transação curta).
+- Testes: `fx.ValidateApp` para cada combinação de componentes; na integração, `fxtest`
+  sobe a composição real (HTTP, consumidor, publisher), confere que o `Stop` termina os
+  workers e libera porta e pool, e que a app não sobe sem banco. O reinício das três
+  réplicas (`make test-restart`) confirma, pelos logs, o encerramento gracioso de cada
+  componente.
 
 ## 5. Fluxo de uma operação
 
@@ -186,43 +192,52 @@ Detalhes em [ADR 0003](docs/adr/0003-identidade-do-provedor.md).
   `provider`) e `wallet-internal` (role de realm `wallet-admin`) no realm
   [deploy/keycloak/realm-wager.json](deploy/keycloak/realm-wager.json).
 
-*A definir (Fase 07):* matriz rota × role.
+**Matriz de autorização** (roles de realm):
+
+| Rota | `provider` | `wallet-admin` |
+| --- | --- | --- |
+| `POST /wagering/transactions` | sim, com o próprio `providerId` | não (`403`) |
+| `GET /wagering/transactions/{id}` | só as próprias (de outro provedor: `404`) | todas |
+| `GET /providers/{providerId}/wagering/transactions/{ext}` | só o próprio `providerId` (outro: `403`) | todos |
+| `POST /wallets`, `GET /wallets/{id}`, `GET /wallets/{id}/ledger`, `POST /wallets/{id}/reconciliation` | não (`403`) | sim |
+| `GET /health/live`, `GET /health/ready` | público | público |
+
+Testes ponta a ponta contra o Keycloak real cobrem token ausente, malformado, adulterado
+e expirado (client `provider-a-short`, tokens de 1 s), a matriz acima, o isolamento entre
+provedores em consultas e replays e a ausência de efeito financeiro nos acessos negados.
 
 ## 8. Classificação de erros
 
 Todo resultado de uma operação cai em uma destas classes. A classe decide se algo é
-gravado, o status HTTP e o destino da mensagem SQS.
+gravado, o status HTTP e o destino da mensagem SQS. Todo corpo de erro tem
+`{"code", "message", "correlationId"}`.
 
-| Classe | Exemplos (`failureCode`) | Grava no banco? | HTTP *(proposta, Fase 07)* | SQS |
+| Classe | Códigos | Grava no banco? | HTTP | SQS |
 | --- | --- | --- | --- | --- |
-| **Sucesso** | `PROCESSED` | sim | `200` (replay também `200`, com `idempotentReplay: true`) | apaga após o commit |
-| **Pendente** | `PENDING_REFERENCE` | sim, e o worker assume | `202` | apaga após o commit |
-| **Rejeição definitiva** | `INSUFFICIENT_FUNDS`, `INSUFFICIENT_FUNDS_FOR_REVERSAL`, `REFERENCE_NOT_FOUND`, `REFERENCE_NOT_PROCESSED`, `REFERENCE_ALREADY_REVERSED`, `INVALID_REFERENCE_KIND`, `REFERENCE_AMOUNT_MISMATCH`, `REFERENCE_CONTEXT_MISMATCH` | sim: `REJECTED` + evento `WagerTransactionRejected` | `422`, com `transactionId`, `status` e `failureCode`; o replay devolve a mesma resposta | apaga após o commit (terminal) |
-| **Entrada corrigível** | `VALIDATION_ERROR` (`400`), `WALLET_MISMATCH` (`400`), `PROVIDER_FORBIDDEN` (`403`), `WALLET_NOT_FOUND` (`404`), `IDEMPOTENCY_CONFLICT` (`409`) | não | conforme o código ao lado | erro permanente da mensagem → DLQ |
-| **Falha transitória** | PostgreSQL indisponível, `lock_timeout`, deadlock, resultado de commit desconhecido, prazo do `context` esgotado | não (rollback) | `503` com `Retry-After` | não apaga; volta após o visibility timeout; esgotadas as tentativas → DLQ |
-| **Falha permanente** | `FAILED`, só para `PENDING_REFERENCE` com erro permanente no worker | sim, para auditoria | visível na consulta da transação | não se aplica (a mensagem já foi concluída) |
+| **Sucesso** | `PROCESSED` | sim | `200` (replay também, com `idempotentReplay: true`); `POST /wallets` → `201` | apaga após o commit |
+| **Pendente** | `PENDING_REFERENCE` | sim; o worker assume | `202` | apaga após o commit |
+| **Rejeição definitiva** | `INSUFFICIENT_FUNDS`, `INSUFFICIENT_FUNDS_FOR_REVERSAL`, `REFERENCE_NOT_FOUND`, `REFERENCE_NOT_PROCESSED`, `REFERENCE_ALREADY_REVERSED`, `INVALID_REFERENCE_KIND`, `REFERENCE_AMOUNT_MISMATCH`, `REFERENCE_CONTEXT_MISMATCH` | sim: `REJECTED` + `WagerTransactionRejected` | `422` com `transactionId`, `status` e `failureCode`; o replay devolve `422` com `idempotentReplay: true` | apaga após o commit (terminal) |
+| **Entrada corrigível** | `VALIDATION_ERROR` e `WALLET_MISMATCH` (`400`), `PROVIDER_FORBIDDEN` (`403`), `WALLET_NOT_FOUND` e `TRANSACTION_NOT_FOUND` (`404`), `IDEMPOTENCY_CONFLICT` e `WALLET_ALREADY_EXISTS` (`409`) | não | conforme o código | DLQ (reentregar não corrige) |
+| **Falha transitória** | `SERVICE_UNAVAILABLE`: PostgreSQL fora, `lock_timeout`, deadlock, resultado de commit desconhecido | não (rollback) | `503` com `Retry-After: 1` | não apaga; volta após o visibility timeout; esgotadas as tentativas → DLQ |
+| **Falha permanente** | `FAILED`, só para `PENDING_REFERENCE` com erro permanente no worker | sim, para auditoria | consulta mostra `FAILED`; replay → `422` | não se aplica |
+| **Erro inesperado** | `INTERNAL_ERROR` (detalhe só no log, ligado pelo `correlationId`) | não | `500` | não apaga; retry até a DLQ |
 
-Outros casos:
+Autenticação e autorização (antes dos casos de uso, nada é gravado):
 
-- **Autenticação:** token ausente, inválido ou expirado → `401`; role insuficiente →
-  `403`. Nada é gravado.
-- **Mensagem SQS inválida** (JSON malformado, tipo desconhecido, mesmo `messageId` com
-  hash diferente) → DLQ.
-- **Erro inesperado** (bug): HTTP `500`; no SQS a mensagem não é apagada e segue o
-  caminho de retry até a DLQ.
+- token ausente, malformado, adulterado, de outro issuer ou audiência, ou expirado →
+  `401 UNAUTHORIZED` com `WWW-Authenticate: Bearer`;
+- role insuficiente para a rota → `403 FORBIDDEN`;
+- `providerId` do corpo ou do caminho diferente do token → `403 PROVIDER_FORBIDDEN`.
 
 Como isso aparece no código Go:
 
 - Rejeição definitiva **não é um `error` Go**: é um resultado concluído e confirmado
   (`Result` com `status = REJECTED`). Por isso o replay pode reproduzi-la.
-- Entrada corrigível e falha transitória são `error`, classificáveis com
-  `errors.Is`/`errors.As`.
-- O mapeamento classe → status HTTP e classe → ação SQS fica em uma única função em cada
-  adapter (`httpapi` e `sqs`).
-
-*A definir:* corpo exato das respostas de erro e código da falha transitória (Fase 07);
-conflito na abertura de carteira duplicada (`409`, código a definir na Fase 06); limites
-de tentativas, visibility timeout e mecanismo de envio à DLQ (Fase 08).
+- Entrada corrigível e falha transitória são `*apperr.Error`, com `Kind` e `Code`;
+  o mapeamento classe → status HTTP fica em `httpapi.writeError` e classe → ação SQS no
+  consumidor.
+- Erro de banco transitório (55P03, 40001, 40P01, conexão) vira `store.ErrUnavailable` no
+  adapter e `apperr.Unavailable` no caso de uso.
 
 ## 9. Dinheiro
 
@@ -267,13 +282,15 @@ Cinco tabelas (`wallets`, `wager_transactions`, `wallet_ledger_entries`,
 Erros de trigger usam SQLSTATE de classe 23 e o nome da regra em `ConstraintName`, como
 as constraints declarativas. O trigger de sequência do extrato não é seguro sozinho sob
 concorrência: a garantia é o `UNIQUE (wallet_id, wallet_version)` somado ao
-`FOR UPDATE` na carteira (Fase 05).
+`FOR NO KEY UPDATE` na carteira (seção 13).
 
 ## 11. Ambiente local e testes de integração
 
-O `docker-compose.yml` sobe PostgreSQL 18.6, LocalStack 4.14.0, Keycloak 26.8.0 e a
-aplicação, todos com healthcheck e limite de memória. A aplicação só inicia depois das
-dependências saudáveis.
+O `docker-compose.yml` sobe PostgreSQL 18.6, LocalStack 4.14.0, Keycloak 26.8.0 e
+**três réplicas** da aplicação (`app`, `app-2`, `app-3`, portas 8081 a 8083), todos com
+healthcheck e limite de memória. Cada réplica é um processo independente, com conexões e
+memória próprias, executando HTTP, consumidor SQS e publisher. A aplicação só inicia
+depois das dependências saudáveis.
 
 | Serviço | Provisionamento | Healthcheck | Memória |
 | --- | --- | --- | --- |
@@ -318,11 +335,18 @@ Detalhes em [ADR 0012](docs/adr/0012-idempotencia-e-hash-canonico.md).
 
 ## 13. Concorrência e locks
 
-- **Fila por carteira:** `SELECT ... FOR UPDATE` na carteira. Carteiras diferentes não se
+- **Fila por carteira:** `SELECT ... FOR NO KEY UPDATE` na carteira. Carteiras diferentes não se
   esperam (sem lock global); a mesma carteira é processada uma operação por vez, em
   qualquer instância, porque o lock fica no PostgreSQL.
 - **Ordem fixa de locks:** inbox (SQS) → operação (INSERT da linha) → carteira. Todos os
-  caminhos seguem a mesma ordem, o que evita deadlock.
+  caminhos seguem a mesma ordem.
+- **Por que `FOR NO KEY UPDATE` e não `FOR UPDATE`:** o INSERT da operação tem FK para a
+  carteira, e o PostgreSQL pega um lock `FOR KEY SHARE` implícito nela. `FOR UPDATE`
+  conflita com `KEY SHARE`: duas operações concorrentes da mesma carteira (cada uma com
+  o seu KEY SHARE) esperavam uma pela outra, num deadlock (`40P01`, virando 503).
+  `FOR NO KEY UPDATE` não conflita com `KEY SHARE` e continua serializando quem disputa a
+  carteira; é o mesmo lock que o `UPDATE` do saldo pega, porque nenhuma coluna de chave
+  muda. O bug foi achado pelo teste de três instâncias e tem teste de regressão.
 - **`lock_timeout`** (`DB_LOCK_TIMEOUT`, padrão 3 s) via `SET LOCAL`: quem espera além
   disso recebe falha transitória (503 / retry do SQS) e nada é gravado.
 - **Lost update:** além do lock, o `UPDATE` da carteira exige `version = nova - 1`; o
@@ -356,7 +380,112 @@ reversão `PROCESSED` (REFUND **ou** ROLLBACK), garantida pelo domínio e pelo �
 devolvido duas vezes). Um `ROLLBACK` do próprio `REFUND` é permitido (debita de volta),
 porque a original dele é o REFUND, e não a BET.
 
-## 15. Limitações e interpretações adotadas
+## 15. Mensageria: entrada SQS, inbox e outbox
+
+Detalhes em [ADR 0013](docs/adr/0013-mensageria-inbox-outbox.md).
+
+**Entrada (`wager-transactions.fifo`).**
+
+- Contrato para quem publica: corpo com o envelope do enunciado (`messageId`, `type =
+  WagerTransactionRequested`, `occurredAt`, `data`); `MessageGroupId = walletId` (as
+  operações de uma carteira chegam em ordem e uma por vez); `MessageDeduplicationId =
+  messageId`. A chave de idempotência é `data.idempotencyKey`.
+- O consumidor recebe até 10 mensagens por vez (long polling de 5 s) e as trata em
+  sequência, com prazo de 20 s por mensagem (o visibility timeout da fila é 30 s).
+- Identidade durável: `messageId` do envelope, registrado na inbox com o SHA-256 do corpo.
+  Reentrega com o mesmo hash → resultado gravado (sem novo efeito); mesmo `messageId` com
+  hash diferente → `MESSAGE_CONFLICT` → DLQ.
+- Destino de cada mensagem: sucesso, rejeição de negócio ou pendência → apaga depois do
+  commit. Mensagem inválida (`INVALID_MESSAGE`) ou erro corrigível → `SendMessage` para a
+  DLQ (atributos `failureCode` e `failureReason`) e apaga; se cair entre os dois passos, a
+  reentrega chega ao mesmo erro e o SQS deduplica o reenvio. Falha transitória ou
+  inesperada → não apaga e adia a reentrega com `ChangeMessageVisibility` (2 s, 4 s, 8 s...
+  até 60 s); depois de 5 recebimentos, o redrive da fila move a mensagem para a DLQ.
+- SQS indisponível: o laço de recebimento espera de forma crescente (até 30 s) e tenta
+  de novo.
+- `SIGTERM`: não cancela o long polling em curso (espera no máximo 5 s; cancelar no
+  meio faria o broker entregar mensagens a uma conexão morta, que só voltariam após o
+  visibility timeout), termina a mensagem em andamento e devolve a visibilidade das
+  recebidas e não iniciadas (reentrega imediata para outra instância).
+
+**Saída (`wallet-events.fifo`).**
+
+- Corpo: o envelope (`eventId`, `eventType`, `aggregateId`, `correlationId`,
+  `causationId` opcional, `occurredAt` em UTC, `version`, `data`). Atributos
+  `eventType` e `aggregateType` (`Wallet`) para roteamento sem abrir o corpo.
+- `MessageGroupId = aggregateId` (walletId): os eventos de uma carteira saem em ordem.
+  `MessageDeduplicationId = eventId`: republicação dentro de 5 min é descartada pelo SQS;
+  depois disso, o consumidor deve deduplicar pelo `eventId` (entrega pelo menos uma vez).
+- Publisher: lotes de 50 com `SKIP LOCKED` e lease de 30 s; confirma `published_at` depois
+  do envio; em falha, backoff de 1 s a 5 min, e os eventos seguintes da mesma carteira
+  esperam junto. Ao encerrar, libera na hora o resto do lote.
+- Recuperação provada em teste: queda entre o commit e a publicação (o evento continua na
+  outbox e outra instância publica), queda entre a publicação e a confirmação (lease vence
+  e o evento sai de novo com o mesmo `eventId`, deduplicado) e dois publishers disputando
+  a mesma outbox (cada evento enviado uma vez).
+
+## 16. Testes de concorrência e falhas
+
+Rodam contra as três réplicas do Compose e o PostgreSQL, SQS e Keycloak reais
+(`make test-integration`; tabela de cenários no README):
+
+- 100.00 com duas apostas de 80.00 em instâncias diferentes: um `200`, um `422
+  INSUFFICIENT_FUNDS`, saldo 20.00 e um único débito (5 rodadas).
+- A mesma aposta 50 vezes nas três instâncias: um processamento original, 49 replays, um
+  débito.
+- 120 operações em 12 carteiras em paralelo: saldos esperados e saldo = soma do extrato.
+- A mesma operação por HTTP e SQS ao mesmo tempo: uma única movimentação.
+- Queda do consumidor depois do commit e antes de apagar: o teste age como o consumidor
+  que recebe, confirma no banco e não apaga (efeito equivalente a um `kill -9` nesse
+  ponto); o consumidor real recebe a reentrega após o visibility timeout, a inbox a
+  reconhece e a mensagem é apagada sem novo débito.
+- Outbox: publishers concorrentes, lease vencido e republicação após queda (seção 15).
+
+Esses testes encontraram três bugs reais, todos corrigidos e com teste de regressão: o
+commit concorrente entre as buscas de idempotência (seção 12), o deadlock do `FOR UPDATE`
+com o `KEY SHARE` da FK (seção 13) e o long polling cancelado no encerramento (seção 15).
+
+## 17. Referências pendentes (worker simplificado)
+
+- Uma operação que referencia algo ainda inexistente fica em `PENDING_REFERENCE` com
+  `next_attempt_at` (primeira tentativa em 1 s) e `expires_at` (prazo de 1 h), e emite
+  `WagerTransactionPendingReference`.
+- O worker de cada instância retoma **uma pendência por transação**: trava a linha com
+  `FOR UPDATE SKIP LOCKED` (outra instância pega outra), trava a carteira e reaplica a
+  mesma decisão do fluxo síncrono:
+  - referência resolvida → processa (ou rejeita, por saldo ou regra), com os eventos;
+  - original existe, mas em `REJECTED`/`FAILED` → `REFERENCE_NOT_PROCESSED`;
+  - ainda sem referência (ou original também pendente) → nova tentativa com backoff
+    exponencial (1 s, 2 s, 4 s... até 5 min);
+  - prazo vencido → `REJECTED REFERENCE_NOT_FOUND` + `WagerTransactionRejected`.
+- Erro permanente ao retomar (não transitório) → `FAILED` com `PERMANENT_FAILURE`, numa
+  transação separada (decisão 3). Erro transitório → a pendência fica como está e volta
+  na próxima volta do worker.
+- Como as pendências estão no banco, sobrevivem a reinícios e são retomadas por qualquer
+  instância (`make test-restart`).
+
+## 18. Reconciliação e observabilidade
+
+- **Reconciliação** (`POST /wallets/{id}/reconciliation`, `wallet-admin`): numa
+  transação `REPEATABLE READ READ ONLY` (`TxRunner.ReadSnapshot`), lê o saldo e soma
+  créditos e débitos do extrato inteiro (inclusive a abertura) na mesma foto do banco.
+  Responde `storedBalance`, `calculatedBalance`, `difference` (gravado − reconstruído),
+  `consistent` e `checkedEntries`. Não altera nada. Divergência → resposta, log `ERROR`
+  e métrica `wallet_reconciliations_total{consistent="false"}`. Na prática, a divergência
+  só pode ser criada burlando o banco como superusuário (o trigger E1 a impede no
+  commit); o teste faz isso para provar a detecção.
+- **Logs** JSON com `service`, `instanceId`, `correlationId`, `messageId`,
+  `transactionId`, `walletId` e `providerId`, sem tokens, credenciais nem payloads
+  completos.
+- **Health:** `/health/live` (processo) e `/health/ready` (PostgreSQL e fila SQS, com
+  prazo de 2 s cada; `503` se algum falhar, com o detalhe só no log).
+- **Métricas** (`/metrics`, Prometheus): resultados por status e origem, replays
+  (duplicatas), latência, conflitos (idempotência, `lock_timeout`, deadlock), destino das
+  mensagens SQS (processada, DLQ, retry), publicação, falhas e atraso da outbox
+  (`outbox_lag_seconds` = idade do evento não publicado mais antigo), reconciliações e
+  retomadas de pendências.
+
+## 19. Limitações e interpretações adotadas
 
 Interpretações (decididas sem regra explícita no enunciado):
 
@@ -366,9 +495,17 @@ Interpretações (decididas sem regra explícita no enunciado):
   se a BET já foi revertida.
 - A referência resolvida é registrada também nas rejeições por referência, para
   auditoria.
-- Sem `correlationId` informado, os eventos usam o id da operação.
+- Sem `correlationId` informado (header `X-Correlation-Id`), a API gera um UUID; os
+  eventos usam esse valor.
+- O serviço interno (`wallet-admin`) não envia operações de provedor e pode consultar
+  operações de qualquer provedor.
+- Replay de uma operação `FAILED` responde `422`, como as rejeições.
+- Códigos da camada HTTP: `UNAUTHORIZED` (401), `FORBIDDEN` (role insuficiente),
+  `INTERNAL_ERROR` (500).
 - Códigos técnicos além do catálogo: `TRANSACTION_NOT_FOUND` (consulta), `MESSAGE_CONFLICT`
-  (mesmo `messageId` com conteúdo diferente) e `SERVICE_UNAVAILABLE` (falha transitória).
+  (mesmo `messageId` com conteúdo diferente), `SERVICE_UNAVAILABLE` (falha transitória),
+  `PERMANENT_FAILURE` (pendência em `FAILED`) e `INVALID_MESSAGE` (mensagem SQS
+  inválida, na DLQ).
 - Eventos do mesmo commit são ordenados por `occurred_at` e `event_id` (UUIDv7,
   monotônico no processo).
 
@@ -377,15 +514,40 @@ Limitações:
 - O "despertar" imediato de reversões pendentes quando a original chega (correção 1 da
   modelagem) não foi implementado: a retomada depende do worker de pendências.
 - O dono das tabelas ou um superusuário pode desligar triggers (ADR 0011).
-- LocalStack Community não aplica IAM (ADR 0003 e 0008).
+- LocalStack Community não aplica IAM (ADR 0003 e 0008); o mapeamento `SenderId` →
+  `providerId` no consumidor não foi implementado.
+- A ordem dos eventos de uma carteira é garantida dentro de um publisher, mas dois
+  publishers podem reservar lotes diferentes da mesma carteira e enviá-los fora de ordem.
+  Consumidores devem usar `walletVersion` (em `WalletBalanceChanged`) e o `eventId` para
+  ordenar e deduplicar.
+- O consumidor trata as mensagens de um lote em sequência (o paralelismo vem de várias
+  instâncias e de vários grupos FIFO).
 
-## 16. Seções a definir
+## 20. Trabalho não concluído e simplificações
 
-| Tema | Fase |
-| --- | --- |
-| Inbox, visibility timeout, `MessageGroupId`/`MessageDeduplicationId` | 08 |
-| Outbox: lease, backoff, contrato dos eventos de saída | 09 |
-| Referências pendentes: backoff, TTL, estados da referência | 10 |
-| Reconciliação, observabilidade e health checks | 11 |
-| Testes de concorrência e falhas | 12 |
-| Trabalho não concluído (consolidado na entrega) | 13 |
+- **Despertar de pendências** (correção 1 da modelagem): não implementado. Uma reversão
+  que chega antes da original espera a próxima tentativa do worker (backoff de até
+  5 min), em vez de ser acordada logo depois que a original chega.
+- **Worker simplificado:** só backoff e TTL. Uma pendência cuja original também está
+  pendente espera junto e, ao fim do prazo, é rejeitada com `REFERENCE_NOT_FOUND`.
+- **`FAILED`** usa o código técnico `PERMANENT_FAILURE` e não emite evento (o enunciado
+  não define um evento para falha permanente).
+- **Aceite assíncrono:** não existe. `PENDING` nunca é confirmado (o banco impõe, E3), então
+  o cenário "interromper depois de confirmar `PENDING`" não se aplica; as operações sem
+  dependências são concluídas na mesma transação.
+- **IAM e `SenderId`:** o LocalStack Community não aplica IAM; as políticas estão
+  documentadas em `deploy/aws/iam-policies.md`, mas o mapeamento `SenderId` →
+  `providerId` no consumidor não foi implementado.
+- **Ordem dos eventos** entre publishers concorrentes da mesma carteira não é garantida
+  (seção 15); consumidores ordenam por `walletVersion` e deduplicam por `eventId`.
+- **Limpeza:** eventos publicados da outbox e registros da inbox não são expurgados (as
+  tabelas crescem; numa operação real haveria rotina de retenção).
+- **`/metrics` público:** sem autenticação; em produção ficaria restrito à rede interna.
+- **Revogação de token** só vale na expiração (validação local, sem introspecção).
+- **Keycloak em modo `start-dev`** (H2 em memória) e LocalStack congelado na 4.14.0
+  (ADR 0008): ambiente de desenvolvimento, não de produção.
+- **Opcionais não feitos:** partidas dobradas, tracing com OpenTelemetry, dashboards e
+  teste de carga.
+- **Desempenho:** não houve teste de carga. O único número medido é o do teste de
+  concorrência: 120 operações em 12 carteiras com três instâncias em cerca de 0,3 s numa
+  execução local (eram 9 s antes da correção do deadlock). Não é benchmark.

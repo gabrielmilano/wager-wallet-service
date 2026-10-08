@@ -6,12 +6,19 @@ import (
 	"net/http"
 	"os"
 
+	awssqs "github.com/aws/aws-sdk-go-v2/service/sqs"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/fx"
 	"go.uber.org/fx/fxevent"
 
 	"github.com/gabrielmilano/wager-wallet-service/internal/adapter/httpapi"
+	"github.com/gabrielmilano/wager-wallet-service/internal/adapter/oidc"
+	sqsadapter "github.com/gabrielmilano/wager-wallet-service/internal/adapter/sqs"
+	"github.com/gabrielmilano/wager-wallet-service/internal/app/wagering"
+	"github.com/gabrielmilano/wager-wallet-service/internal/app/wallets"
 	"github.com/gabrielmilano/wager-wallet-service/internal/platform/config"
 	"github.com/gabrielmilano/wager-wallet-service/internal/platform/logging"
+	"github.com/gabrielmilano/wager-wallet-service/internal/platform/metrics"
 )
 
 // Options monta a aplicação a partir da configuração já validada. Componentes
@@ -25,6 +32,18 @@ func Options(cfg config.Config) fx.Option {
 		fx.Invoke(logLifecycle),
 		postgresModule,
 		appModule,
+	}
+	if cfg.Components.SQSConsumer || cfg.Components.OutboxPublisher {
+		opts = append(opts, sqsModule)
+	}
+	if cfg.Components.SQSConsumer {
+		opts = append(opts, consumerModule)
+	}
+	if cfg.Components.OutboxPublisher {
+		opts = append(opts, outboxModule)
+	}
+	if cfg.Components.PendingWorker {
+		opts = append(opts, pendingModule)
 	}
 	if cfg.Components.HTTP {
 		opts = append(opts, httpModule)
@@ -72,13 +91,47 @@ func logLifecycle(lc fx.Lifecycle, cfg config.Config, log *slog.Logger) {
 
 var httpModule = fx.Module("http",
 	fx.Provide(
-		httpapi.NewRouter,
+		newVerifier,
+		newRouter,
 		newHTTPServer,
 	),
 	// Invoke força a construção do servidor; sem ele o Fx não criaria um
 	// valor que ninguém pede, e o hook nunca seria registrado.
 	fx.Invoke(func(*httpapi.Server) {}),
 )
+
+// newVerifier valida tokens sem discovery (ADR 0009).
+func newVerifier(cfg config.Config) *oidc.Verifier {
+	return oidc.NewVerifier(cfg.OIDC.IssuerURL, cfg.OIDC.JWKSURL, cfg.OIDC.Audience)
+}
+
+type routerParams struct {
+	fx.In
+	Wagering *wagering.Service
+	Wallets  *wallets.Service
+	Verifier *oidc.Verifier
+	Log      *slog.Logger
+	Metrics  *metrics.Metrics
+	Config   config.Config
+	Pool     *pgxpool.Pool
+	SQS      *awssqs.Client `optional:"true"` // só existe com consumidor ou publisher ligado
+}
+
+// newRouter monta a API com os checks de readiness: PostgreSQL sempre e SQS
+// quando algum componente usa a fila.
+func newRouter(p routerParams) http.Handler {
+	checks := []httpapi.ReadinessCheck{{Name: "postgres", Check: p.Pool.Ping}}
+	if p.SQS != nil {
+		checks = append(checks, httpapi.ReadinessCheck{Name: "sqs", Check: func(ctx context.Context) error {
+			_, err := sqsadapter.QueueURL(ctx, p.SQS, p.Config.AWS.InputQueueName)
+			return err
+		}})
+	}
+	return httpapi.NewRouter(httpapi.Deps{
+		Wagering: p.Wagering, Wallets: p.Wallets, Verifier: p.Verifier, Log: p.Log,
+		Metrics: p.Metrics, Readiness: checks,
+	})
+}
 
 // newHTTPServer liga o Server ao ciclo de vida. Se o servidor cair depois de
 // iniciado, a aplicação inteira encerra com código 1 em vez de seguir sem
