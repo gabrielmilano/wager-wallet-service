@@ -42,7 +42,7 @@ services:
     ports:
       - "4566:4566"
     volumes:
-      - ./deploy/localstack/init/ready.d:/etc/localstack/init/ready.d:ro
+      - ./deploy/localstack/init:/etc/localstack/init:ro
     healthcheck:
       # Arquivo criado pelo script de filas somente se tudo deu certo.
       test: ["CMD", "test", "-f", "/tmp/queues-ready"]
