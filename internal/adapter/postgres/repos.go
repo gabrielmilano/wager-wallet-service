@@ -55,8 +55,15 @@ func (r *walletRepo) Get(ctx context.Context, id uuid.UUID) (*wallet.Wallet, err
 
 // GetForUpdate é a fila por carteira: outra transação que peça o mesmo lock
 // espera esta terminar (até o lock_timeout).
+//
+// FOR NO KEY UPDATE, e não FOR UPDATE: o INSERT da operação, antes deste
+// SELECT, pega um lock FOR KEY SHARE implícito na carteira por causa da FK.
+// FOR UPDATE conflita com KEY SHARE, então duas operações concorrentes (cada
+// uma com seu KEY SHARE) esperavam uma pela outra: deadlock. FOR NO KEY
+// UPDATE não conflita com KEY SHARE e continua serializando quem disputa a
+// carteira; é o mesmo lock que o UPDATE do saldo pega (nenhuma chave muda).
 func (r *walletRepo) GetForUpdate(ctx context.Context, id uuid.UUID) (*wallet.Wallet, error) {
-	return scanWallet(r.q.QueryRow(ctx, `SELECT `+walletColumns+` FROM wallets WHERE id = $1 FOR UPDATE`, id))
+	return scanWallet(r.q.QueryRow(ctx, `SELECT `+walletColumns+` FROM wallets WHERE id = $1 FOR NO KEY UPDATE`, id))
 }
 
 // UpdateBalance confere a versão anterior no WHERE: se alguém tivesse mudado

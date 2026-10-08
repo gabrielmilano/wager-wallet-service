@@ -476,6 +476,46 @@ func TestSameBetFiftyTimesInParallel(t *testing.T) {
 	}
 }
 
+// Regressão: com FOR UPDATE, o KEY SHARE implícito da FK (INSERT da operação)
+// e o lock da carteira formavam deadlock entre operações concorrentes da mesma
+// carteira; uma delas virava 503. Agora nenhuma pode falhar.
+func TestConcurrentOperationsOnSameWalletHaveNoDeadlock(t *testing.T) {
+	ctx := testContext(t)
+	u := newUsecases(t, ctx, 3*time.Second)
+	w := u.open(t, ctx, "100.00")
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := range 30 {
+		kind, amount := "BET", "2.00"
+		if i%3 == 0 {
+			kind, amount = "WIN", "1.00"
+		}
+		in := op(t, w, kind, amount, "")
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			res, err := u.process(t, ctx, in)
+			if err != nil {
+				t.Errorf("%s: %v", kind, err)
+				return
+			}
+			if res.Transaction.Status() != wager.Processed {
+				t.Errorf("%s: %s", kind, res.Transaction.Status())
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	// 20 BETs de 2.00 e 10 WINs de 1.00: 100 - 40 + 10.
+	if amount, version := u.balance(t, ctx, w.ID()); amount != "70.00" || version != 31 {
+		t.Errorf("saldo %s versão %d, want 70.00 e 31", amount, version)
+	}
+	u.reconcile(t, ctx, w.ID())
+}
+
 func TestDifferentWalletsProceedInParallel(t *testing.T) {
 	ctx := testContext(t)
 	u := newUsecases(t, ctx, 3*time.Second)

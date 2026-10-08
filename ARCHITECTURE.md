@@ -276,7 +276,7 @@ Cinco tabelas (`wallets`, `wager_transactions`, `wallet_ledger_entries`,
 Erros de trigger usam SQLSTATE de classe 23 e o nome da regra em `ConstraintName`, como
 as constraints declarativas. O trigger de sequência do extrato não é seguro sozinho sob
 concorrência: a garantia é o `UNIQUE (wallet_id, wallet_version)` somado ao
-`FOR UPDATE` na carteira (Fase 05).
+`FOR NO KEY UPDATE` na carteira (seção 13).
 
 ## 11. Ambiente local e testes de integração
 
@@ -327,11 +327,18 @@ Detalhes em [ADR 0012](docs/adr/0012-idempotencia-e-hash-canonico.md).
 
 ## 13. Concorrência e locks
 
-- **Fila por carteira:** `SELECT ... FOR UPDATE` na carteira. Carteiras diferentes não se
+- **Fila por carteira:** `SELECT ... FOR NO KEY UPDATE` na carteira. Carteiras diferentes não se
   esperam (sem lock global); a mesma carteira é processada uma operação por vez, em
   qualquer instância, porque o lock fica no PostgreSQL.
 - **Ordem fixa de locks:** inbox (SQS) → operação (INSERT da linha) → carteira. Todos os
-  caminhos seguem a mesma ordem, o que evita deadlock.
+  caminhos seguem a mesma ordem.
+- **Por que `FOR NO KEY UPDATE` e não `FOR UPDATE`:** o INSERT da operação tem FK para a
+  carteira, e o PostgreSQL pega um lock `FOR KEY SHARE` implícito nela. `FOR UPDATE`
+  conflita com `KEY SHARE`: duas operações concorrentes da mesma carteira (cada uma com
+  o seu KEY SHARE) esperavam uma pela outra, num deadlock (`40P01`, virando 503).
+  `FOR NO KEY UPDATE` não conflita com `KEY SHARE` e continua serializando quem disputa a
+  carteira; é o mesmo lock que o `UPDATE` do saldo pega, porque nenhuma coluna de chave
+  muda. O bug foi achado pelo teste de três instâncias e tem teste de regressão.
 - **`lock_timeout`** (`DB_LOCK_TIMEOUT`, padrão 3 s) via `SET LOCAL`: quem espera além
   disso recebe falha transitória (503 / retry do SQS) e nada é gravado.
 - **Lost update:** além do lock, o `UPDATE` da carteira exige `version = nova - 1`; o

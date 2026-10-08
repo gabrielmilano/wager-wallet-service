@@ -44,7 +44,7 @@ type WalletRepository interface {
 	Insert(ctx context.Context, w *wallet.Wallet) error
 	// Get lê sem lock; ErrNotFound se não existe.
 	Get(ctx context.Context, id uuid.UUID) (*wallet.Wallet, error)
-	// GetForUpdate lê com SELECT ... FOR UPDATE: a fila por carteira.
+	// GetForUpdate lê com lock de linha (FOR NO KEY UPDATE): a fila por carteira.
 	GetForUpdate(ctx context.Context, id uuid.UUID) (*wallet.Wallet, error)
 	// UpdateBalance grava saldo e versão; confere que a versão gravada é a
 	// anterior (proteção extra contra lost update, além do lock).
