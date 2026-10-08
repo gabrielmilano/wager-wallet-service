@@ -26,6 +26,8 @@ Principais garantias (detalhes em [ARCHITECTURE.md](ARCHITECTURE.md)):
 - Go 1.27.x (com cgo/gcc para `go test -race`)
 - Docker e Docker Compose v2
 - `make`
+- `curl`, `jq` e `uuidgen`, usados nos exemplos de chamadas (no Ubuntu/Debian:
+  `sudo apt-get install -y curl jq uuid-runtime`; no macOS, `brew install jq`)
 - Cerca de 2 GB de memória livre para os containers (limites: Keycloak 768 MB,
   LocalStack 512 MB, PostgreSQL 256 MB e 128 MB por réplica da app)
 - Portas livres: `5432` (PostgreSQL), `4566` (LocalStack), `8180` (Keycloak), `8081`,
@@ -134,16 +136,19 @@ As filas são criadas automaticamente quando o LocalStack fica pronto, pelo scri
 Todas são FIFO, sem deduplicação por conteúdo (quem envia informa o
 `MessageDeduplicationId`). Contrato de entrada: `MessageGroupId = walletId` e
 `MessageDeduplicationId = messageId` do envelope. Para listar as filas e enviar uma
-operação pela fila (usando `$PLAYER` e `$WALLET` dos exemplos abaixo):
+operação pela fila (usando `$PLAYER` e `$WALLET` dos exemplos abaixo; os ids da
+mensagem e da operação são novos a cada execução):
 
 ```sh
 docker compose exec localstack awslocal sqs list-queues
 
+MSG_ID="msg-$(date +%s)"
+SQS_TX_ID="tx-sqs-$(date +%s)"
 docker compose exec localstack awslocal sqs send-message \
   --queue-url http://localhost:4566/000000000000/wager-transactions.fifo \
-  --message-group-id "$WALLET" --message-deduplication-id msg-123 \
-  --message-body '{"messageId":"msg-123","type":"WagerTransactionRequested","occurredAt":"2026-09-08T12:00:00.000Z",
-    "data":{"providerId":"provider-a","externalTransactionId":"transaction-456","idempotencyKey":"provider-a:transaction-456",
+  --message-group-id "$WALLET" --message-deduplication-id "$MSG_ID" \
+  --message-body '{"messageId":"'$MSG_ID'","type":"WagerTransactionRequested","occurredAt":"2026-09-08T12:00:00.000Z",
+    "data":{"providerId":"provider-a","externalTransactionId":"'$SQS_TX_ID'","idempotencyKey":"provider-a:'$SQS_TX_ID'",
     "playerId":"'$PLAYER'","walletId":"'$WALLET'","roundId":"round-987","gameId":"fortune-chimp",
     "kind":"BET","money":{"amount":"10.00","currency":"BRL"}}}'
 
@@ -153,7 +158,9 @@ docker compose exec localstack awslocal sqs receive-message \
 ```
 
 Erros permanentes (mensagem inválida, carteira inexistente etc.) vão para
-`wager-transactions-dlq.fifo` com os atributos `failureCode` e `failureReason`.
+`wager-transactions-dlq.fifo` com os atributos `failureCode` e `failureReason`. Reenviar
+o mesmo `messageId` com outro conteúdo também vai para a DLQ (`MESSAGE_CONFLICT`), de
+propósito: a inbox reconhece a mensagem pelo `messageId`.
 
 As políticas IAM que controlariam o acesso na AWS real estão em
 [deploy/aws/iam-policies.md](deploy/aws/iam-policies.md); o LocalStack Community não
@@ -190,7 +197,9 @@ de realm (`provider`, `wallet-admin`) e o claim `provider_id`.
 
 ## Exemplos de chamadas
 
-Com o ambiente no ar (`make up`) e `jq` instalado:
+Com o ambiente no ar (`make up`) e `curl`, `jq` e `uuidgen` instalados. O bloco pode ser
+executado quantas vezes quiser: cada execução cria uma carteira e usa um id de operação
+novo (`TX_ID`).
 
 ```sh
 KC=http://localhost:8180/realms/wager/protocol/openid-connect/token
@@ -198,6 +207,7 @@ token() { curl -s $KC -d grant_type=client_credentials -d client_id=$1 -d client
 ADMIN=$(token wallet-internal)
 PROVIDER=$(token provider-a)
 PLAYER=$(uuidgen | tr A-Z a-z)
+TX_ID="tx-$(date +%s)"
 
 # Abrir carteira (serviço interno) -> 201
 WALLET=$(curl -s -X POST localhost:8081/wallets -H "Authorization: Bearer $ADMIN" \
@@ -206,8 +216,8 @@ WALLET=$(curl -s -X POST localhost:8081/wallets -H "Authorization: Bearer $ADMIN
 
 # Aposta (provedor) -> 200; repetir o mesmo comando -> 200 com idempotentReplay: true
 curl -s -X POST localhost:8081/wagering/transactions -H "Authorization: Bearer $PROVIDER" \
-  -H 'Content-Type: application/json' -H 'Idempotency-Key: provider-a:transaction-123' \
-  -d '{"providerId":"provider-a","externalTransactionId":"transaction-123","playerId":"'$PLAYER'",
+  -H 'Content-Type: application/json' -H "Idempotency-Key: provider-a:$TX_ID" \
+  -d '{"providerId":"provider-a","externalTransactionId":"'$TX_ID'","playerId":"'$PLAYER'",
        "walletId":"'$WALLET'","roundId":"round-987","gameId":"fortune-chimp","kind":"BET",
        "money":{"amount":"25.00","currency":"BRL"}}' | jq
 
@@ -215,9 +225,15 @@ curl -s -X POST localhost:8081/wagering/transactions -H "Authorization: Bearer $
 curl -s localhost:8081/wallets/$WALLET -H "Authorization: Bearer $ADMIN" | jq
 curl -s -X POST localhost:8081/wallets/$WALLET/reconciliation -H "Authorization: Bearer $ADMIN" | jq
 curl -s "localhost:8081/wallets/$WALLET/ledger?limit=50" -H "Authorization: Bearer $ADMIN" | jq
-curl -s localhost:8081/providers/provider-a/wagering/transactions/transaction-123 \
+curl -s localhost:8081/providers/provider-a/wagering/transactions/$TX_ID \
   -H "Authorization: Bearer $PROVIDER" | jq
 ```
+
+> **Sobre reutilizar ids.** Repetir a mesma operação (mesmo `TX_ID` e mesmo corpo) devolve
+> o resultado gravado, com `idempotentReplay: true`. Reutilizar o mesmo `TX_ID` (e a mesma
+> `Idempotency-Key`) com um corpo diferente, por exemplo outra carteira ou outro valor,
+> devolve `409 IDEMPOTENCY_CONFLICT` **de propósito**: é a proteção contra reaplicar uma
+> operação com outro conteúdo. Por isso os exemplos geram um `TX_ID` novo a cada execução.
 
 Status: `200` processado, `202` aguardando referência, `422` rejeitado (com
 `failureCode`), `400` entrada inválida, `401` sem token válido, `403` sem permissão,
