@@ -362,19 +362,23 @@ func (r *outboxRepo) Insert(ctx context.Context, events ...event.Envelope) error
 // concorrentes pegam lotes diferentes; o lease (locked_until) devolve à fila
 // o lote de um publisher que caiu.
 func (r *outboxRepo) Claim(ctx context.Context, owner string, now, leaseUntil time.Time, limit int) ([]store.OutboxEvent, error) {
+	// UPDATE ... RETURNING não garante ordem: a CTE reordena o lote, para
+	// que os eventos de uma carteira saiam na ordem em que foram gravados.
 	rows, err := r.q.Query(ctx,
-		`UPDATE outbox_events
-		    SET locked_by = $1, locked_until = $3, attempts = attempts + 1
-		  WHERE event_id IN (
-		        SELECT event_id FROM outbox_events
-		         WHERE published_at IS NULL
-		           AND next_attempt_at <= $2
-		           AND (locked_until IS NULL OR locked_until < $2)
-		         ORDER BY occurred_at, event_id
-		         LIMIT $4
-		         FOR UPDATE SKIP LOCKED)
-		 RETURNING event_id, aggregate_id, event_type, event_version, correlation_id,
-		           causation_id, payload, occurred_at, attempts`,
+		`WITH claimed AS (
+		     UPDATE outbox_events
+		        SET locked_by = $1, locked_until = $3, attempts = attempts + 1
+		      WHERE event_id IN (
+		            SELECT event_id FROM outbox_events
+		             WHERE published_at IS NULL
+		               AND next_attempt_at <= $2
+		               AND (locked_until IS NULL OR locked_until < $2)
+		             ORDER BY occurred_at, event_id
+		             LIMIT $4
+		             FOR UPDATE SKIP LOCKED)
+		     RETURNING event_id, aggregate_id, event_type, event_version, correlation_id,
+		               causation_id, payload, occurred_at, attempts)
+		 SELECT * FROM claimed ORDER BY occurred_at, event_id`,
 		owner, now, leaseUntil, limit)
 	if err != nil {
 		return nil, translate(err)
