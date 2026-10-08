@@ -10,6 +10,9 @@ import (
 	"go.uber.org/fx/fxevent"
 
 	"github.com/gabrielmilano/wager-wallet-service/internal/adapter/httpapi"
+	"github.com/gabrielmilano/wager-wallet-service/internal/adapter/oidc"
+	"github.com/gabrielmilano/wager-wallet-service/internal/app/wagering"
+	"github.com/gabrielmilano/wager-wallet-service/internal/app/wallets"
 	"github.com/gabrielmilano/wager-wallet-service/internal/platform/config"
 	"github.com/gabrielmilano/wager-wallet-service/internal/platform/logging"
 )
@@ -72,13 +75,23 @@ func logLifecycle(lc fx.Lifecycle, cfg config.Config, log *slog.Logger) {
 
 var httpModule = fx.Module("http",
 	fx.Provide(
-		httpapi.NewRouter,
+		newVerifier,
+		newRouter,
 		newHTTPServer,
 	),
 	// Invoke força a construção do servidor; sem ele o Fx não criaria um
 	// valor que ninguém pede, e o hook nunca seria registrado.
 	fx.Invoke(func(*httpapi.Server) {}),
 )
+
+// newVerifier valida tokens sem discovery (ADR 0009).
+func newVerifier(cfg config.Config) *oidc.Verifier {
+	return oidc.NewVerifier(cfg.OIDC.IssuerURL, cfg.OIDC.JWKSURL, cfg.OIDC.Audience)
+}
+
+func newRouter(w *wagering.Service, ws *wallets.Service, v *oidc.Verifier, log *slog.Logger) http.Handler {
+	return httpapi.NewRouter(httpapi.Deps{Wagering: w, Wallets: ws, Verifier: v, Log: log})
+}
 
 // newHTTPServer liga o Server ao ciclo de vida. Se o servidor cair depois de
 // iniciado, a aplicação inteira encerra com código 1 em vez de seguir sem
