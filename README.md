@@ -136,11 +136,47 @@ TOKEN=$(curl -s http://localhost:8180/realms/wager/protocol/openid-connect/token
   -d client_secret=provider-a-secret | jq -r .access_token)   # requer jq
 ```
 
-A validação dos tokens pela aplicação entra na Fase 07.
+Os tokens valem 5 minutos (o client `provider-a-short`, só para testes, emite tokens de
+1 segundo). A aplicação valida assinatura, `iss`, `aud` e `exp` (ADR 0009) e lê as roles
+de realm (`provider`, `wallet-admin`) e o claim `provider_id`.
+
+> Mudanças no realm exigem recriar o container do Keycloak (`make clean` ou
+> `docker compose rm -sf keycloak && make up`): o import ignora realms existentes.
 
 ## Exemplos de chamadas
 
-_A definir._
+Com o ambiente no ar (`make up`) e `jq` instalado:
+
+```sh
+KC=http://localhost:8180/realms/wager/protocol/openid-connect/token
+token() { curl -s $KC -d grant_type=client_credentials -d client_id=$1 -d client_secret=$1-secret | jq -r .access_token; }
+ADMIN=$(token wallet-internal)
+PROVIDER=$(token provider-a)
+PLAYER=$(uuidgen | tr A-Z a-z)
+
+# Abrir carteira (serviço interno) -> 201
+WALLET=$(curl -s -X POST localhost:8081/wallets -H "Authorization: Bearer $ADMIN" \
+  -H 'Content-Type: application/json' \
+  -d '{"playerId":"'$PLAYER'","initialBalance":{"amount":"1000.00","currency":"BRL"}}' | jq -r .id)
+
+# Aposta (provedor) -> 200; repetir o mesmo comando -> 200 com idempotentReplay: true
+curl -s -X POST localhost:8081/wagering/transactions -H "Authorization: Bearer $PROVIDER" \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: provider-a:transaction-123' \
+  -d '{"providerId":"provider-a","externalTransactionId":"transaction-123","playerId":"'$PLAYER'",
+       "walletId":"'$WALLET'","roundId":"round-987","gameId":"fortune-chimp","kind":"BET",
+       "money":{"amount":"25.00","currency":"BRL"}}' | jq
+
+# Consultas
+curl -s localhost:8081/wallets/$WALLET -H "Authorization: Bearer $ADMIN" | jq
+curl -s "localhost:8081/wallets/$WALLET/ledger?limit=50" -H "Authorization: Bearer $ADMIN" | jq
+curl -s localhost:8081/providers/provider-a/wagering/transactions/transaction-123 \
+  -H "Authorization: Bearer $PROVIDER" | jq
+```
+
+Status: `200` processado, `202` aguardando referência, `422` rejeitado (com
+`failureCode`), `400` entrada inválida, `401` sem token válido, `403` sem permissão,
+`404` inexistente, `409` conflito de idempotência, `503` indisponível (com
+`Retry-After`). Detalhes em [ARCHITECTURE.md](ARCHITECTURE.md#8-classificação-de-erros).
 
 ## Testes
 

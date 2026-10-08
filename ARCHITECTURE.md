@@ -186,43 +186,52 @@ Detalhes em [ADR 0003](docs/adr/0003-identidade-do-provedor.md).
   `provider`) e `wallet-internal` (role de realm `wallet-admin`) no realm
   [deploy/keycloak/realm-wager.json](deploy/keycloak/realm-wager.json).
 
-*A definir (Fase 07):* matriz rota × role.
+**Matriz de autorização** (roles de realm):
+
+| Rota | `provider` | `wallet-admin` |
+| --- | --- | --- |
+| `POST /wagering/transactions` | sim, com o próprio `providerId` | não (`403`) |
+| `GET /wagering/transactions/{id}` | só as próprias (de outro provedor: `404`) | todas |
+| `GET /providers/{providerId}/wagering/transactions/{ext}` | só o próprio `providerId` (outro: `403`) | todos |
+| `POST /wallets`, `GET /wallets/{id}`, `GET /wallets/{id}/ledger`, `POST /wallets/{id}/reconciliation` | não (`403`) | sim |
+| `GET /health/live`, `GET /health/ready` | público | público |
+
+Testes ponta a ponta contra o Keycloak real cobrem token ausente, malformado, adulterado
+e expirado (client `provider-a-short`, tokens de 1 s), a matriz acima, o isolamento entre
+provedores em consultas e replays e a ausência de efeito financeiro nos acessos negados.
 
 ## 8. Classificação de erros
 
 Todo resultado de uma operação cai em uma destas classes. A classe decide se algo é
-gravado, o status HTTP e o destino da mensagem SQS.
+gravado, o status HTTP e o destino da mensagem SQS. Todo corpo de erro tem
+`{"code", "message", "correlationId"}`.
 
-| Classe | Exemplos (`failureCode`) | Grava no banco? | HTTP *(proposta, Fase 07)* | SQS |
+| Classe | Códigos | Grava no banco? | HTTP | SQS |
 | --- | --- | --- | --- | --- |
-| **Sucesso** | `PROCESSED` | sim | `200` (replay também `200`, com `idempotentReplay: true`) | apaga após o commit |
-| **Pendente** | `PENDING_REFERENCE` | sim, e o worker assume | `202` | apaga após o commit |
-| **Rejeição definitiva** | `INSUFFICIENT_FUNDS`, `INSUFFICIENT_FUNDS_FOR_REVERSAL`, `REFERENCE_NOT_FOUND`, `REFERENCE_NOT_PROCESSED`, `REFERENCE_ALREADY_REVERSED`, `INVALID_REFERENCE_KIND`, `REFERENCE_AMOUNT_MISMATCH`, `REFERENCE_CONTEXT_MISMATCH` | sim: `REJECTED` + evento `WagerTransactionRejected` | `422`, com `transactionId`, `status` e `failureCode`; o replay devolve a mesma resposta | apaga após o commit (terminal) |
-| **Entrada corrigível** | `VALIDATION_ERROR` (`400`), `WALLET_MISMATCH` (`400`), `PROVIDER_FORBIDDEN` (`403`), `WALLET_NOT_FOUND` (`404`), `IDEMPOTENCY_CONFLICT` (`409`) | não | conforme o código ao lado | erro permanente da mensagem → DLQ |
-| **Falha transitória** | PostgreSQL indisponível, `lock_timeout`, deadlock, resultado de commit desconhecido, prazo do `context` esgotado | não (rollback) | `503` com `Retry-After` | não apaga; volta após o visibility timeout; esgotadas as tentativas → DLQ |
-| **Falha permanente** | `FAILED`, só para `PENDING_REFERENCE` com erro permanente no worker | sim, para auditoria | visível na consulta da transação | não se aplica (a mensagem já foi concluída) |
+| **Sucesso** | `PROCESSED` | sim | `200` (replay também, com `idempotentReplay: true`); `POST /wallets` → `201` | apaga após o commit |
+| **Pendente** | `PENDING_REFERENCE` | sim; o worker assume | `202` | apaga após o commit |
+| **Rejeição definitiva** | `INSUFFICIENT_FUNDS`, `INSUFFICIENT_FUNDS_FOR_REVERSAL`, `REFERENCE_NOT_FOUND`, `REFERENCE_NOT_PROCESSED`, `REFERENCE_ALREADY_REVERSED`, `INVALID_REFERENCE_KIND`, `REFERENCE_AMOUNT_MISMATCH`, `REFERENCE_CONTEXT_MISMATCH` | sim: `REJECTED` + `WagerTransactionRejected` | `422` com `transactionId`, `status` e `failureCode`; o replay devolve `422` com `idempotentReplay: true` | apaga após o commit (terminal) |
+| **Entrada corrigível** | `VALIDATION_ERROR` e `WALLET_MISMATCH` (`400`), `PROVIDER_FORBIDDEN` (`403`), `WALLET_NOT_FOUND` e `TRANSACTION_NOT_FOUND` (`404`), `IDEMPOTENCY_CONFLICT` e `WALLET_ALREADY_EXISTS` (`409`) | não | conforme o código | DLQ (reentregar não corrige) |
+| **Falha transitória** | `SERVICE_UNAVAILABLE`: PostgreSQL fora, `lock_timeout`, deadlock, resultado de commit desconhecido | não (rollback) | `503` com `Retry-After: 1` | não apaga; volta após o visibility timeout; esgotadas as tentativas → DLQ |
+| **Falha permanente** | `FAILED`, só para `PENDING_REFERENCE` com erro permanente no worker | sim, para auditoria | consulta mostra `FAILED`; replay → `422` | não se aplica |
+| **Erro inesperado** | `INTERNAL_ERROR` (detalhe só no log, ligado pelo `correlationId`) | não | `500` | não apaga; retry até a DLQ |
 
-Outros casos:
+Autenticação e autorização (antes dos casos de uso, nada é gravado):
 
-- **Autenticação:** token ausente, inválido ou expirado → `401`; role insuficiente →
-  `403`. Nada é gravado.
-- **Mensagem SQS inválida** (JSON malformado, tipo desconhecido, mesmo `messageId` com
-  hash diferente) → DLQ.
-- **Erro inesperado** (bug): HTTP `500`; no SQS a mensagem não é apagada e segue o
-  caminho de retry até a DLQ.
+- token ausente, malformado, adulterado, de outro issuer ou audiência, ou expirado →
+  `401 UNAUTHORIZED` com `WWW-Authenticate: Bearer`;
+- role insuficiente para a rota → `403 FORBIDDEN`;
+- `providerId` do corpo ou do caminho diferente do token → `403 PROVIDER_FORBIDDEN`.
 
 Como isso aparece no código Go:
 
 - Rejeição definitiva **não é um `error` Go**: é um resultado concluído e confirmado
   (`Result` com `status = REJECTED`). Por isso o replay pode reproduzi-la.
-- Entrada corrigível e falha transitória são `error`, classificáveis com
-  `errors.Is`/`errors.As`.
-- O mapeamento classe → status HTTP e classe → ação SQS fica em uma única função em cada
-  adapter (`httpapi` e `sqs`).
-
-*A definir:* corpo exato das respostas de erro e código da falha transitória (Fase 07);
-conflito na abertura de carteira duplicada (`409`, código a definir na Fase 06); limites
-de tentativas, visibility timeout e mecanismo de envio à DLQ (Fase 08).
+- Entrada corrigível e falha transitória são `*apperr.Error`, com `Kind` e `Code`;
+  o mapeamento classe → status HTTP fica em `httpapi.writeError` e classe → ação SQS no
+  consumidor.
+- Erro de banco transitório (55P03, 40001, 40P01, conexão) vira `store.ErrUnavailable` no
+  adapter e `apperr.Unavailable` no caso de uso.
 
 ## 9. Dinheiro
 
@@ -366,7 +375,13 @@ Interpretações (decididas sem regra explícita no enunciado):
   se a BET já foi revertida.
 - A referência resolvida é registrada também nas rejeições por referência, para
   auditoria.
-- Sem `correlationId` informado, os eventos usam o id da operação.
+- Sem `correlationId` informado (header `X-Correlation-Id`), a API gera um UUID; os
+  eventos usam esse valor.
+- O serviço interno (`wallet-admin`) não envia operações de provedor e pode consultar
+  operações de qualquer provedor.
+- Replay de uma operação `FAILED` responde `422`, como as rejeições.
+- Códigos da camada HTTP: `UNAUTHORIZED` (401), `FORBIDDEN` (role insuficiente),
+  `INTERNAL_ERROR` (500).
 - Códigos técnicos além do catálogo: `TRANSACTION_NOT_FOUND` (consulta), `MESSAGE_CONFLICT`
   (mesmo `messageId` com conteúdo diferente) e `SERVICE_UNAVAILABLE` (falha transitória).
 - Eventos do mesmo commit são ordenados por `occurred_at` e `event_id` (UUIDv7,
