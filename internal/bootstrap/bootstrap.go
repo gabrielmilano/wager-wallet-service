@@ -38,6 +38,9 @@ func Options(cfg config.Config) fx.Option {
 	if cfg.Components.OutboxPublisher {
 		opts = append(opts, outboxModule)
 	}
+	if cfg.Components.PendingWorker {
+		opts = append(opts, pendingModule)
+	}
 	if cfg.Components.HTTP {
 		opts = append(opts, httpModule)
 	}

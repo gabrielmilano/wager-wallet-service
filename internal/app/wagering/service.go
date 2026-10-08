@@ -275,6 +275,11 @@ func (s *Service) decide(ctx context.Context, r store.Repos, tx *wager.Transacti
 	res := wager.ResolveReference(tx, original, reversed)
 	switch res.Outcome {
 	case wager.Wait:
+		if tx.Status() == wager.PendingReference {
+			// Retomada pelo worker: quem decide entre nova tentativa e
+			// expiração é ResumeNextPending.
+			return outcome{}, nil
+		}
 		return outcome{}, tx.WaitForReference(now.Add(FirstRetryDelay), now.Add(ReferenceTTL), now)
 	case wager.Reject:
 		ref := res.ReferenceID
