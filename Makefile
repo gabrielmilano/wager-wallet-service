@@ -5,7 +5,7 @@ COMPOSE ?= docker compose
 MIGRATE = $(COMPOSE) run --rm --build migrate migrate
 N ?= 1
 
-.PHONY: help fmt fmt-check vet test test-race tidy check up down clean logs ps test-integration migrate-up migrate-down migrate-version migrate-force
+.PHONY: help fmt fmt-check vet test test-race tidy check up down clean logs ps test-integration migrate-up migrate-down migrate-version migrate-force test-restart
 
 help: ## Lista os alvos disponíveis
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-18s %s\n", $$1, $$2}'
@@ -60,3 +60,6 @@ migrate-force: ## Marca a versão V como aplicada e limpa o dirty (ex.: make mig
 
 test-integration: ## Testes de integração contra o ambiente do Compose (exige make up)
 	CGO_ENABLED=1 $(GO) test -race -count=1 -tags=integration ./...
+
+test-restart: ## Reinicia as três réplicas e confere idempotência, pendências e saldo (exige make up)
+	CGO_ENABLED=1 $(GO) test -race -count=1 -tags=integration,restart -run TestRestartPreservesState -v ./test/integration/

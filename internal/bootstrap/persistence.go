@@ -12,6 +12,7 @@ import (
 	"github.com/gabrielmilano/wager-wallet-service/internal/app/wagering"
 	"github.com/gabrielmilano/wager-wallet-service/internal/app/wallets"
 	"github.com/gabrielmilano/wager-wallet-service/internal/platform/config"
+	"github.com/gabrielmilano/wager-wallet-service/internal/platform/metrics"
 )
 
 // postgresModule fornece o pool e o TxRunner. O pool é criado antes dos
@@ -42,12 +43,16 @@ func newTxRunner(pool *pgxpool.Pool, cfg config.Config) store.TxRunner {
 	return postgres.NewTxRunner(pool, cfg.DBLockTimeout)
 }
 
-// appModule fornece os casos de uso e as portas de tempo e identidade.
+// appModule fornece os casos de uso, as portas de tempo e identidade e as
+// métricas (um único registro por processo).
 var appModule = fx.Module("app",
 	fx.Provide(
 		func() port.Clock { return port.SystemClock{} },
 		func() port.IDGenerator { return port.UUIDv7{} },
+		metrics.New,
 		wagering.NewService,
-		wallets.NewService,
+		func(tx store.TxRunner, clock port.Clock, ids port.IDGenerator, m *metrics.Metrics) *wallets.Service {
+			return wallets.NewService(tx, clock, ids).WithMetrics(m)
+		},
 	),
 )

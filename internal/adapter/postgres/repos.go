@@ -309,6 +309,17 @@ func (r *ledgerRepo) List(ctx context.Context, walletID uuid.UUID, afterVersion 
 	return out, translate(rows.Err())
 }
 
+func (r *ledgerRepo) Totals(ctx context.Context, walletID uuid.UUID) (int64, int64, int, error) {
+	var credits, debits int64
+	var entries int
+	err := r.q.QueryRow(ctx,
+		`SELECT COALESCE(SUM(amount_minor) FILTER (WHERE direction = 'CREDIT'), 0)::bigint,
+		        COALESCE(SUM(amount_minor) FILTER (WHERE direction = 'DEBIT'), 0)::bigint,
+		        COUNT(*)
+		   FROM wallet_ledger_entries WHERE wallet_id = $1`, walletID).Scan(&credits, &debits, &entries)
+	return credits, debits, entries, translate(err)
+}
+
 // --- inbox_messages ----------------------------------------------------------
 
 type inboxRepo struct{ q querier }
@@ -433,4 +444,12 @@ func (r *outboxRepo) MarkFailed(ctx context.Context, eventID uuid.UUID, owner st
 		return fmt.Errorf("%w: evento %s não está reservado por %s", store.ErrNotFound, eventID, owner)
 	}
 	return nil
+}
+
+func (r *outboxRepo) Backlog(ctx context.Context) (int, *time.Time, error) {
+	var pending int
+	var oldest *time.Time
+	err := r.q.QueryRow(ctx,
+		`SELECT COUNT(*), MIN(occurred_at) FROM outbox_events WHERE published_at IS NULL`).Scan(&pending, &oldest)
+	return pending, oldest, translate(err)
 }
