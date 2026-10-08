@@ -1,8 +1,8 @@
 # Arquitetura
 
 Este documento registra as decisões técnicas do `wager-wallet-service`. Os detalhes e as
-alternativas de cada decisão estão nos ADRs em [docs/adr/](docs/adr/). Seções marcadas
-como *a definir* serão preenchidas nas fases indicadas.
+alternativas de cada decisão estão nos ADRs em [docs/adr/](docs/adr/). As seções finais
+listam limitações, interpretações adotadas e o que não foi concluído.
 
 ## 1. Visão geral
 
@@ -16,9 +16,9 @@ por variável de ambiente ([ADR 0002](docs/adr/0002-binario-unico.md)):
 | Publisher da outbox | Publica em `wallet-events.fifo` os eventos já confirmados no banco |
 | Worker de referências pendentes | Retoma operações em `PENDING_REFERENCE` com backoff |
 
-Várias instâncias do mesmo binário rodam em paralelo. Toda a coordenação entre elas
-acontece no PostgreSQL (locks por linha, `SKIP LOCKED`, constraints e triggers). Nenhuma
-instância guarda estado que outra precise.
+Várias instâncias do mesmo binário rodam em paralelo (o Compose sobe três réplicas).
+Toda a coordenação entre elas acontece no PostgreSQL (locks por linha, `SKIP LOCKED`,
+constraints e triggers) e no SQS. Nenhuma instância guarda estado que outra precise.
 
 ## 2. Camadas e regra de dependência
 
@@ -107,11 +107,17 @@ docs/adr/                Architecture Decision Records
   aplicação inteira encerra com código 1 (`fx.Shutdowner`).
 - `wallet-service healthcheck` chama `/health/live` da própria instância; é o
   healthcheck do container, já que a imagem distroless não tem `curl`.
-- Testes: `fx.ValidateApp` para cada combinação de componentes e `fxtest` para início,
-  resposta HTTP e liberação da porta após o encerramento.
-
-*A definir (Fases 07 a 10):* prazos de shutdown por componente, término observável
-dos workers e teste com `fxtest` comprovando a liberação de recursos dos workers.
+- **Workers** (consumidor SQS, publisher da outbox, worker de pendências) rodam em
+  goroutines com contexto próprio. O `OnStop` cancela o contexto e espera a goroutine
+  terminar; se o prazo do Fx acabar antes, devolve erro (término observável). Ao
+  encerrar: o consumidor não pega mensagens novas, termina a que está em andamento e
+  devolve a visibilidade das demais; o publisher libera o resto do lote; o worker de
+  pendências termina a pendência atual (uma transação curta).
+- Testes: `fx.ValidateApp` para cada combinação de componentes; na integração, `fxtest`
+  sobe a composição real (HTTP, consumidor, publisher), confere que o `Stop` termina os
+  workers e libera porta e pool, e que a app não sobe sem banco. O reinício das três
+  réplicas (`make test-restart`) confirma, pelos logs, o encerramento gracioso de cada
+  componente.
 
 ## 5. Fluxo de uma operação
 
@@ -439,7 +445,47 @@ Esses testes encontraram três bugs reais, todos corrigidos e com teste de regre
 commit concorrente entre as buscas de idempotência (seção 12), o deadlock do `FOR UPDATE`
 com o `KEY SHARE` da FK (seção 13) e o long polling cancelado no encerramento (seção 15).
 
-## 17. Limitações e interpretações adotadas
+## 17. Referências pendentes (worker simplificado)
+
+- Uma operação que referencia algo ainda inexistente fica em `PENDING_REFERENCE` com
+  `next_attempt_at` (primeira tentativa em 1 s) e `expires_at` (prazo de 1 h), e emite
+  `WagerTransactionPendingReference`.
+- O worker de cada instância retoma **uma pendência por transação**: trava a linha com
+  `FOR UPDATE SKIP LOCKED` (outra instância pega outra), trava a carteira e reaplica a
+  mesma decisão do fluxo síncrono:
+  - referência resolvida → processa (ou rejeita, por saldo ou regra), com os eventos;
+  - original existe, mas em `REJECTED`/`FAILED` → `REFERENCE_NOT_PROCESSED`;
+  - ainda sem referência (ou original também pendente) → nova tentativa com backoff
+    exponencial (1 s, 2 s, 4 s... até 5 min);
+  - prazo vencido → `REJECTED REFERENCE_NOT_FOUND` + `WagerTransactionRejected`.
+- Erro permanente ao retomar (não transitório) → `FAILED` com `PERMANENT_FAILURE`, numa
+  transação separada (decisão 3). Erro transitório → a pendência fica como está e volta
+  na próxima volta do worker.
+- Como as pendências estão no banco, sobrevivem a reinícios e são retomadas por qualquer
+  instância (`make test-restart`).
+
+## 18. Reconciliação e observabilidade
+
+- **Reconciliação** (`POST /wallets/{id}/reconciliation`, `wallet-admin`): numa
+  transação `REPEATABLE READ READ ONLY` (`TxRunner.ReadSnapshot`), lê o saldo e soma
+  créditos e débitos do extrato inteiro (inclusive a abertura) na mesma foto do banco.
+  Responde `storedBalance`, `calculatedBalance`, `difference` (gravado − reconstruído),
+  `consistent` e `checkedEntries`. Não altera nada. Divergência → resposta, log `ERROR`
+  e métrica `wallet_reconciliations_total{consistent="false"}`. Na prática, a divergência
+  só pode ser criada burlando o banco como superusuário (o trigger E1 a impede no
+  commit); o teste faz isso para provar a detecção.
+- **Logs** JSON com `service`, `instanceId`, `correlationId`, `messageId`,
+  `transactionId`, `walletId` e `providerId`, sem tokens, credenciais nem payloads
+  completos.
+- **Health:** `/health/live` (processo) e `/health/ready` (PostgreSQL e fila SQS, com
+  prazo de 2 s cada; `503` se algum falhar, com o detalhe só no log).
+- **Métricas** (`/metrics`, Prometheus): resultados por status e origem, replays
+  (duplicatas), latência, conflitos (idempotência, `lock_timeout`, deadlock), destino das
+  mensagens SQS (processada, DLQ, retry), publicação, falhas e atraso da outbox
+  (`outbox_lag_seconds` = idade do evento não publicado mais antigo), reconciliações e
+  retomadas de pendências.
+
+## 19. Limitações e interpretações adotadas
 
 Interpretações (decididas sem regra explícita no enunciado):
 
@@ -457,7 +503,9 @@ Interpretações (decididas sem regra explícita no enunciado):
 - Códigos da camada HTTP: `UNAUTHORIZED` (401), `FORBIDDEN` (role insuficiente),
   `INTERNAL_ERROR` (500).
 - Códigos técnicos além do catálogo: `TRANSACTION_NOT_FOUND` (consulta), `MESSAGE_CONFLICT`
-  (mesmo `messageId` com conteúdo diferente) e `SERVICE_UNAVAILABLE` (falha transitória).
+  (mesmo `messageId` com conteúdo diferente), `SERVICE_UNAVAILABLE` (falha transitória),
+  `PERMANENT_FAILURE` (pendência em `FAILED`) e `INVALID_MESSAGE` (mensagem SQS
+  inválida, na DLQ).
 - Eventos do mesmo commit são ordenados por `occurred_at` e `event_id` (UUIDv7,
   monotônico no processo).
 
@@ -475,10 +523,31 @@ Limitações:
 - O consumidor trata as mensagens de um lote em sequência (o paralelismo vem de várias
   instâncias e de vários grupos FIFO).
 
-## 18. Seções a definir
+## 20. Trabalho não concluído e simplificações
 
-| Tema | Fase |
-| --- | --- |
-| Referências pendentes: backoff, TTL, estados da referência | 10 |
-| Reconciliação, observabilidade e health checks | 11 |
-| Trabalho não concluído (consolidado na entrega) | 13 |
+- **Despertar de pendências** (correção 1 da modelagem): não implementado. Uma reversão
+  que chega antes da original espera a próxima tentativa do worker (backoff de até
+  5 min), em vez de ser acordada logo depois que a original chega.
+- **Worker simplificado:** só backoff e TTL. Uma pendência cuja original também está
+  pendente espera junto e, ao fim do prazo, é rejeitada com `REFERENCE_NOT_FOUND`.
+- **`FAILED`** usa o código técnico `PERMANENT_FAILURE` e não emite evento (o enunciado
+  não define um evento para falha permanente).
+- **Aceite assíncrono:** não existe. `PENDING` nunca é confirmado (o banco impõe, E3), então
+  o cenário "interromper depois de confirmar `PENDING`" não se aplica; as operações sem
+  dependências são concluídas na mesma transação.
+- **IAM e `SenderId`:** o LocalStack Community não aplica IAM; as políticas estão
+  documentadas em `deploy/aws/iam-policies.md`, mas o mapeamento `SenderId` →
+  `providerId` no consumidor não foi implementado.
+- **Ordem dos eventos** entre publishers concorrentes da mesma carteira não é garantida
+  (seção 15); consumidores ordenam por `walletVersion` e deduplicam por `eventId`.
+- **Limpeza:** eventos publicados da outbox e registros da inbox não são expurgados (as
+  tabelas crescem; numa operação real haveria rotina de retenção).
+- **`/metrics` público:** sem autenticação; em produção ficaria restrito à rede interna.
+- **Revogação de token** só vale na expiração (validação local, sem introspecção).
+- **Keycloak em modo `start-dev`** (H2 em memória) e LocalStack congelado na 4.14.0
+  (ADR 0008): ambiente de desenvolvimento, não de produção.
+- **Opcionais não feitos:** partidas dobradas, tracing com OpenTelemetry, dashboards e
+  teste de carga.
+- **Desempenho:** não houve teste de carga. O único número medido é o do teste de
+  concorrência: 120 operações em 12 carteiras com três instâncias em cerca de 0,3 s numa
+  execução local (eram 9 s antes da correção do deadlock). Não é benchmark.
