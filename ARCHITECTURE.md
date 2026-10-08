@@ -156,7 +156,7 @@ resultado é conhecido, a transação foi desfeita e o erro é definitivo; sem r
 servidor, o resultado é desconhecido e tratado como transitório (a idempotência torna a
 repetição segura).
 
-*A definir (Fase 05):* isolamento, `FOR UPDATE`, ordem fixa de locks e `lock_timeout`.
+Isolamento, locks e `lock_timeout`: seção 13.
 
 ## 7. Autenticação e autorização
 
@@ -235,8 +235,14 @@ de tentativas, visibility timeout e mecanismo de envio à DLQ (Fase 08).
 - Parsing: validação do formato e conversão dos dígitos sem o ponto com
   `strconv.ParseInt`; estouro detectado por `strconv.ErrRange`.
 
-*A definir (Fase 04):* limites numéricos, regras exatas de formato e overflow na
-aritmética.
+- **Formato aceito:** sinal `-` opcional, parte inteira sem zeros à esquerda e
+  exatamente duas casas (`25.00`, `0.50`, `-5.00`). Recusa vazio, espaços, `+`, vírgula,
+  notação científica, `NaN`, `Infinity`, escala diferente de 2 e `-0.00`. Nada é
+  arredondado.
+- **Limites:** de `-92233720368547758.08` a `92233720368547758.07` (int64 em centavos).
+  Parsing, soma, subtração e negação devolvem `ErrOverflow` além disso.
+- **Moedas:** lista fechada `BRL`, `USD` e `EUR` (a mesma do CHECK do banco); aritmética e
+  comparação entre moedas diferentes devolvem `ErrCurrencyMismatch`.
 
 ## 10. Schema e invariantes no banco
 
@@ -286,16 +292,100 @@ dependências saudáveis.
 - **Imagem da aplicação:** build multi-stage, binário estático, imagem final
   `distroless/static-debian13:nonroot` (cerca de 18 MB).
 
-## 12. Seções a definir
+## 12. Idempotência
+
+Detalhes em [ADR 0012](docs/adr/0012-idempotencia-e-hash-canonico.md).
+
+- **Chave:** header `Idempotency-Key` (HTTP) ou `data.idempotencyKey` (SQS), obrigatória;
+  o servidor nunca a substitui por outra calculada. Escopo por provedor.
+- **Hash:** SHA-256 do JSON canônico do `Command`: `externalTransactionId`, `gameId`,
+  `kind`, `money` (`{"amount","currency"}` como strings), `playerId`, `providerId`,
+  `referenceExternalTransactionId` (omitido se ausente), `roundId` e `walletId`, com as
+  chaves em ordem alfabética. Fora do hash: a chave de idempotência e os metadados de
+  transporte (`correlationId`, `messageId`). Normalização: UUIDs na forma minúscula com
+  hífens (a entrada aceita maiúsculas). Valores monetários não são normalizados, porque o
+  parsing só aceita a forma canônica. HTTP e SQS montam o mesmo `Command`, então geram o
+  mesmo hash.
+- **Resultados:** mesma chave e conteúdo → replay do estado e do saldo gravados
+  (`idempotentReplay: true`), inclusive para rejeições e pendências; mesma chave com outro
+  conteúdo → `IDEMPOTENCY_CONFLICT`; mesmo `externalTransactionId` com outra chave →
+  `IDEMPOTENCY_CONFLICT`.
+- **Corrida:** `INSERT ... ON CONFLICT DO NOTHING` espera a transação concorrente terminar.
+  As duas buscas (por chave e por id externo) são comandos separados em READ COMMITTED; o
+  código compara a chave do registro encontrado, para que um commit concorrente entre
+  elas seja tratado como replay, e não como conflito. Esse caso foi encontrado pelo teste
+  de 50 envios paralelos e tem teste de regressão.
+
+## 13. Concorrência e locks
+
+- **Fila por carteira:** `SELECT ... FOR UPDATE` na carteira. Carteiras diferentes não se
+  esperam (sem lock global); a mesma carteira é processada uma operação por vez, em
+  qualquer instância, porque o lock fica no PostgreSQL.
+- **Ordem fixa de locks:** inbox (SQS) → operação (INSERT da linha) → carteira. Todos os
+  caminhos seguem a mesma ordem, o que evita deadlock.
+- **`lock_timeout`** (`DB_LOCK_TIMEOUT`, padrão 3 s) via `SET LOCAL`: quem espera além
+  disso recebe falha transitória (503 / retry do SQS) e nada é gravado.
+- **Lost update:** além do lock, o `UPDATE` da carteira exige `version = nova - 1`; o
+  banco ainda confere o saldo contra o extrato no commit (E1, ADR 0011).
+- **Isolamento:** READ COMMITTED. Depois de obter o lock, cada comando vê os commits
+  anteriores, então a segunda aposta de 80.00 lê o saldo 20.00 e é rejeitada.
+
+## 14. Operações, reversões e referências
+
+| Tipo | Movimento | Regras |
+| --- | --- | --- |
+| `BET` | débito | valor > 0; sem saldo → `INSUFFICIENT_FUNDS` |
+| `WIN` | crédito | valor > 0; com referência, ela precisa ser uma `BET` da mesma rodada e contexto |
+| `LOSS` | nenhum | valor `0.00`; `PROCESSED` sem lançamento e sem mudar a versão |
+| `REFUND` | crédito | referência obrigatória a uma `BET`; valor igual |
+| `ROLLBACK` | oposto do original | referência obrigatória a `BET` (crédito), `WIN` ou `REFUND` (débito); valor igual; sem saldo → `INSUFFICIENT_FUNDS_FOR_REVERSAL` |
+
+Resolução da referência (função pura `wager.ResolveReference`), nesta ordem:
+
+1. não encontrada → `PENDING_REFERENCE` (primeira retentativa em 1 s, prazo de 1 h);
+2. tipo incompatível → `INVALID_REFERENCE_KIND`;
+3. jogador, carteira, moeda ou rodada diferentes → `REFERENCE_CONTEXT_MISMATCH`;
+4. original em `PENDING_REFERENCE` → continua esperando;
+5. original `REJECTED` ou `FAILED` → `REFERENCE_NOT_PROCESSED`;
+6. valor diferente (REFUND/ROLLBACK) → `REFERENCE_AMOUNT_MISMATCH`;
+7. original já revertida (REFUND/ROLLBACK) → `REFERENCE_ALREADY_REVERSED`.
+
+**Combinações de REFUND e ROLLBACK:** cada operação original admite no máximo **uma**
+reversão `PROCESSED` (REFUND **ou** ROLLBACK), garantida pelo domínio e pelo índice único
+`ux_tx_single_reversal`. Uma BET reembolsada não pode ser desfeita de novo (o débito não é
+devolvido duas vezes). Um `ROLLBACK` do próprio `REFUND` é permitido (debita de volta),
+porque a original dele é o REFUND, e não a BET.
+
+## 15. Limitações e interpretações adotadas
+
+Interpretações (decididas sem regra explícita no enunciado):
+
+- `referenceExternalTransactionId` em `BET` ou `LOSS` → `VALIDATION_ERROR` (o contrato só
+  prevê referência em WIN, REFUND e ROLLBACK).
+- `WIN` com referência confere tipo (`BET`), contexto e estado da BET, mas não o valor nem
+  se a BET já foi revertida.
+- A referência resolvida é registrada também nas rejeições por referência, para
+  auditoria.
+- Sem `correlationId` informado, os eventos usam o id da operação.
+- Códigos técnicos além do catálogo: `TRANSACTION_NOT_FOUND` (consulta), `MESSAGE_CONFLICT`
+  (mesmo `messageId` com conteúdo diferente) e `SERVICE_UNAVAILABLE` (falha transitória).
+- Eventos do mesmo commit são ordenados por `occurred_at` e `event_id` (UUIDv7,
+  monotônico no processo).
+
+Limitações:
+
+- O "despertar" imediato de reversões pendentes quando a original chega (correção 1 da
+  modelagem) não foi implementado: a retomada depende do worker de pendências.
+- O dono das tabelas ou um superusuário pode desligar triggers (ADR 0011).
+- LocalStack Community não aplica IAM (ADR 0003 e 0008).
+
+## 16. Seções a definir
 
 | Tema | Fase |
 | --- | --- |
-| Concorrência e locks por carteira | 05 |
-| Idempotência: hash canônico, campos e normalizações | 06 |
-| Reversões (`REFUND`/`ROLLBACK`) e suas combinações | 06 |
 | Inbox, visibility timeout, `MessageGroupId`/`MessageDeduplicationId` | 08 |
 | Outbox: lease, backoff, contrato dos eventos de saída | 09 |
 | Referências pendentes: backoff, TTL, estados da referência | 10 |
 | Reconciliação, observabilidade e health checks | 11 |
 | Testes de concorrência e falhas | 12 |
-| Limitações, interpretações adotadas e trabalho não concluído | 13 |
+| Trabalho não concluído (consolidado na entrega) | 13 |
