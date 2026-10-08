@@ -37,6 +37,7 @@ Equivalente sem `make`: `docker compose up --build`.
 | Serviço | Endereço no host | Observação |
 | --- | --- | --- |
 | app | <http://localhost:8081> | `GET /health/live` |
+| migrate | — | aplica as migrations e termina; a app só sobe depois dele |
 | PostgreSQL | `localhost:5432` | banco `wager_wallet`; roles `app_migrator` e `app_runtime` |
 | LocalStack (SQS) | <http://localhost:4566> | versão 4.14.0, sem auth token ([ADR 0008](docs/adr/0008-versao-do-localstack.md)) |
 | Keycloak | <http://localhost:8180> | console de administração: `admin` / `admin` |
@@ -57,7 +58,38 @@ go run ./cmd/wallet-service
 
 ## Migrations
 
-_A definir: aplicação e reversão._
+As migrations ficam em [migrations/](migrations/) (golang-migrate, um par `up`/`down` por
+tabela) e são **embutidas no binário**
+([ADR 0010](docs/adr/0010-migrations-embutidas.md)). Elas rodam como `app_migrator`, dono
+do schema; a aplicação usa `app_runtime`, que não tem `DELETE`, `TRUNCATE` nem `UPDATE` no
+extrato.
+
+`make up` já aplica tudo: o serviço `migrate` roda `migrate up` e termina, e só então a
+app sobe. Para operar à mão (com o PostgreSQL no ar):
+
+```sh
+make migrate-version        # versão aplicada e se está dirty
+make migrate-up             # aplica as pendentes
+make migrate-down           # reverte a última
+make migrate-down N=5       # reverte as últimas 5 (todas, hoje)
+make migrate-force V=3      # marca a versão 3 como aplicada e limpa o dirty
+```
+
+Sem `make`, o mesmo pelo binário (`MIGRATIONS_DATABASE_URL` do `.env`):
+
+```sh
+go run ./cmd/wallet-service migrate up | down [N] | version | force V
+```
+
+**Estado dirty:** se uma migration falhar no meio, o golang-migrate marca a versão como
+*dirty* e recusa novos comandos. Para recuperar:
+
+1. confira com `make migrate-version` qual versão ficou dirty;
+2. veja no banco o que a migration chegou a aplicar e desfaça (ou complete) à mão;
+3. marque a última versão íntegra com `make migrate-force V=<versão>`;
+4. rode `make migrate-up` de novo.
+
+O `force` não executa SQL: ele só corrige o registro de versão.
 
 ## Filas SQS
 
@@ -130,8 +162,17 @@ make up
 make test-integration   # go test -race -count=1 -tags=integration ./...
 ```
 
-Hoje verificam os roles do PostgreSQL, as filas e o redrive, os tokens do Keycloak e a
-liveness da aplicação.
+Hoje verificam:
+
+- **infraestrutura:** roles do PostgreSQL, filas e redrive, tokens do Keycloak e liveness;
+- **schema** ([ADR 0011](docs/adr/0011-invariantes-no-banco.md)): o banco recusa saldo
+  negativo, carteira duplicada, operação duplicada (mesmo com outra chave), segunda
+  abertura, segunda reversão, edição ou exclusão do extrato, transição de estado
+  inválida, `PENDING` confirmado, lançamento fora de sequência ou incoerente com a
+  operação, e saldo divergente do extrato no commit. Cada caso confere o SQLSTATE e o
+  nome da constraint;
+- **migrations:** `up` → `down` completo → `up` num banco temporário, sem sobras.
+  Usa `POSTGRES_ADMIN_URL` (superusuário local) para criar e apagar esse banco.
 
 _Múltiplas instâncias e simulações de falha: a definir (Fase 12)._
 
