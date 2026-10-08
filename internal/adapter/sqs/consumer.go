@@ -63,7 +63,7 @@ func NewConsumer(client *awssqs.Client, processor Processor, log *slog.Logger, c
 		cfg.MaxMessages = 10
 	}
 	if cfg.WaitTime <= 0 {
-		cfg.WaitTime = 10 * time.Second
+		cfg.WaitTime = 5 * time.Second
 	}
 	if cfg.MessageTimeout <= 0 {
 		cfg.MessageTimeout = 20 * time.Second
@@ -74,14 +74,17 @@ func NewConsumer(client *awssqs.Client, processor Processor, log *slog.Logger, c
 	return &Consumer{client: client, processor: processor, log: log, cfg: cfg}
 }
 
-// Run consome até ctx ser cancelado. O cancelamento interrompe a busca de
-// novas mensagens; a mensagem em andamento termina com o próprio prazo e as
-// já recebidas e não iniciadas têm a visibilidade liberada (reentrega
-// imediata para outra instância).
+// Run consome até ctx ser cancelado. O cancelamento não interrompe o long
+// polling em curso (no máximo WaitTime): cancelar a requisição no meio faria
+// o broker entregar a próxima mensagem a uma conexão morta, e ela só voltaria
+// depois do visibility timeout. Encerrando, as mensagens recebidas e não
+// iniciadas têm a visibilidade devolvida (reentrega imediata para outra
+// instância) e a mensagem em andamento termina com o próprio prazo.
 func (c *Consumer) Run(ctx context.Context) {
 	failures := 0
 	for ctx.Err() == nil {
-		out, err := c.client.ReceiveMessage(ctx, &awssqs.ReceiveMessageInput{
+		receiveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.cfg.WaitTime+10*time.Second)
+		out, err := c.client.ReceiveMessage(receiveCtx, &awssqs.ReceiveMessageInput{
 			QueueUrl:            aws.String(c.cfg.QueueURL),
 			MaxNumberOfMessages: c.cfg.MaxMessages,
 			WaitTimeSeconds:     int32(c.cfg.WaitTime / time.Second),
@@ -90,6 +93,7 @@ func (c *Consumer) Run(ctx context.Context) {
 				types.MessageSystemAttributeNameMessageGroupId,
 			},
 		})
+		cancel()
 		if err != nil {
 			if ctx.Err() != nil {
 				return

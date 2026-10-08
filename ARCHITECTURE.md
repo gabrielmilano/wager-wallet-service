@@ -375,7 +375,7 @@ Detalhes em [ADR 0013](docs/adr/0013-mensageria-inbox-outbox.md).
   WagerTransactionRequested`, `occurredAt`, `data`); `MessageGroupId = walletId` (as
   operações de uma carteira chegam em ordem e uma por vez); `MessageDeduplicationId =
   messageId`. A chave de idempotência é `data.idempotencyKey`.
-- O consumidor recebe até 10 mensagens por vez (long polling de 10 s) e as trata em
+- O consumidor recebe até 10 mensagens por vez (long polling de 5 s) e as trata em
   sequência, com prazo de 20 s por mensagem (o visibility timeout da fila é 30 s).
 - Identidade durável: `messageId` do envelope, registrado na inbox com o SHA-256 do corpo.
   Reentrega com o mesmo hash → resultado gravado (sem novo efeito); mesmo `messageId` com
@@ -388,8 +388,10 @@ Detalhes em [ADR 0013](docs/adr/0013-mensageria-inbox-outbox.md).
   até 60 s); depois de 5 recebimentos, o redrive da fila move a mensagem para a DLQ.
 - SQS indisponível: o laço de recebimento espera de forma crescente (até 30 s) e tenta
   de novo.
-- `SIGTERM`: para de buscar mensagens, termina a mensagem em andamento e devolve a
-  visibilidade das recebidas e não iniciadas (reentrega imediata para outra instância).
+- `SIGTERM`: não cancela o long polling em curso (espera no máximo 5 s; cancelar no
+  meio faria o broker entregar mensagens a uma conexão morta, que só voltariam após o
+  visibility timeout), termina a mensagem em andamento e devolve a visibilidade das
+  recebidas e não iniciadas (reentrega imediata para outra instância).
 
 **Saída (`wallet-events.fifo`).**
 
