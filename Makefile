@@ -2,8 +2,10 @@
 
 GO ?= go
 COMPOSE ?= docker compose
+MIGRATE = $(COMPOSE) run --rm --build migrate migrate
+N ?= 1
 
-.PHONY: help fmt fmt-check vet test test-race tidy check up down clean logs ps test-integration
+.PHONY: help fmt fmt-check vet test test-race tidy check up down clean logs ps test-integration migrate-up migrate-down migrate-version migrate-force
 
 help: ## Lista os alvos disponíveis
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-18s %s\n", $$1, $$2}'
@@ -42,6 +44,19 @@ logs: ## Acompanha os logs de todos os serviços
 
 ps: ## Mostra o estado dos serviços
 	$(COMPOSE) ps
+
+migrate-up: ## Aplica as migrations pendentes (exige o PostgreSQL no ar)
+	$(MIGRATE) up
+
+migrate-down: ## Reverte as últimas N migrations (padrão N=1; ex.: make migrate-down N=5)
+	$(MIGRATE) down $(N)
+
+migrate-version: ## Mostra a versão aplicada e se está dirty
+	$(MIGRATE) version
+
+migrate-force: ## Marca a versão V como aplicada e limpa o dirty (ex.: make migrate-force V=3)
+	@test -n "$(V)" || (echo "informe V, ex.: make migrate-force V=3"; exit 2)
+	$(MIGRATE) force $(V)
 
 test-integration: ## Testes de integração contra o ambiente do Compose (exige make up)
 	CGO_ENABLED=1 $(GO) test -race -count=1 -tags=integration ./...
