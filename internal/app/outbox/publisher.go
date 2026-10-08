@@ -24,6 +24,7 @@ type Config struct {
 	Lease        time.Duration // posse de um lote; vencida, outra instância assume
 	PollInterval time.Duration // espera quando não há eventos
 	MaxBackoff   time.Duration // teto da espera entre tentativas de um evento
+	Metrics      port.Metrics  // opcional
 }
 
 func (c Config) withDefaults() Config {
@@ -38,6 +39,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.MaxBackoff <= 0 {
 		c.MaxBackoff = 5 * time.Minute
+	}
+	if c.Metrics == nil {
+		c.Metrics = port.NopMetrics{}
 	}
 	return c
 }
@@ -103,6 +107,7 @@ func (p *Publisher) PublishBatch(ctx context.Context) (int, error) {
 			continue
 		}
 		if err := p.sender.Send(ctx, e); err != nil {
+			p.cfg.Metrics.OutboxFailed()
 			next := p.clock.Now().Add(Backoff(e.Attempts, p.cfg.MaxBackoff))
 			blocked[e.Envelope.AggregateID] = next
 			p.log.Warn("falha ao publicar evento", slog.String("eventId", e.Envelope.EventID.String()),
@@ -118,7 +123,27 @@ func (p *Publisher) PublishBatch(ctx context.Context) (int, error) {
 		}
 		published++
 	}
+	p.cfg.Metrics.OutboxPublished(published)
 	return published, nil
+}
+
+// reportBacklog atualiza as métricas de atraso da outbox.
+func (p *Publisher) reportBacklog(ctx context.Context) {
+	var pending int
+	var oldest *time.Time
+	err := p.tx.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
+		var err error
+		pending, oldest, err = r.Outbox.Backlog(ctx)
+		return err
+	})
+	if err != nil {
+		return
+	}
+	lag := time.Duration(0)
+	if oldest != nil {
+		lag = p.clock.Now().Sub(*oldest)
+	}
+	p.cfg.Metrics.OutboxBacklog(pending, lag)
 }
 
 func (p *Publisher) markPublished(ctx context.Context, e store.OutboxEvent) error {
@@ -142,6 +167,7 @@ func (p *Publisher) Run(ctx context.Context) {
 	failures := 0
 	for ctx.Err() == nil {
 		n, err := p.PublishBatch(ctx)
+		p.reportBacklog(ctx)
 		wait := time.Duration(0)
 		switch {
 		case err != nil:

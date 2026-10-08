@@ -27,13 +27,74 @@ const (
 
 // Service abre carteiras e atende às consultas de carteira e extrato.
 type Service struct {
-	tx    store.TxRunner
-	clock port.Clock
-	ids   port.IDGenerator
+	tx      store.TxRunner
+	clock   port.Clock
+	ids     port.IDGenerator
+	metrics port.Metrics
 }
 
 func NewService(tx store.TxRunner, clock port.Clock, ids port.IDGenerator) *Service {
-	return &Service{tx: tx, clock: clock, ids: ids}
+	return &Service{tx: tx, clock: clock, ids: ids, metrics: port.NopMetrics{}}
+}
+
+// WithMetrics liga as métricas (opcional).
+func (s *Service) WithMetrics(m port.Metrics) *Service {
+	s.metrics = m
+	return s
+}
+
+// Reconciliation compara o saldo gravado com o reconstruído pelo extrato.
+type Reconciliation struct {
+	WalletID          uuid.UUID
+	StoredBalance     money.Money
+	CalculatedBalance money.Money
+	Difference        money.Money // gravado - reconstruído
+	Consistent        bool
+	CheckedEntries    int
+}
+
+// Reconcile reconstrói o saldo a partir do extrato (incluindo a abertura) e
+// compara com o gravado, numa foto consistente do banco (REPEATABLE READ,
+// somente leitura). Não altera nada.
+func (s *Service) Reconcile(ctx context.Context, walletID uuid.UUID) (Reconciliation, error) {
+	var rec Reconciliation
+	err := s.tx.ReadSnapshot(ctx, func(ctx context.Context, r store.Repos) error {
+		w, err := r.Wallets.Get(ctx, walletID)
+		if err != nil {
+			return err
+		}
+		credits, debits, entries, err := r.Ledger.Totals(ctx, walletID)
+		if err != nil {
+			return err
+		}
+		c := w.Currency()
+		creditsM, err := money.New(credits, c)
+		if err != nil {
+			return err
+		}
+		debitsM, err := money.New(debits, c)
+		if err != nil {
+			return err
+		}
+		calculated, err := creditsM.Sub(debitsM)
+		if err != nil {
+			return err
+		}
+		diff, err := w.Balance().Sub(calculated)
+		if err != nil {
+			return err
+		}
+		rec = Reconciliation{
+			WalletID: walletID, StoredBalance: w.Balance(), CalculatedBalance: calculated,
+			Difference: diff, Consistent: diff.IsZero(), CheckedEntries: entries,
+		}
+		return nil
+	})
+	if err != nil {
+		return Reconciliation{}, classify(err)
+	}
+	s.metrics.Reconciliation(rec.Consistent)
+	return rec, nil
 }
 
 // OpenInput é a abertura como chega da API (o Money já foi decodificado).

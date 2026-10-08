@@ -6,15 +6,19 @@ import (
 	"net/http"
 	"os"
 
+	awssqs "github.com/aws/aws-sdk-go-v2/service/sqs"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/fx"
 	"go.uber.org/fx/fxevent"
 
 	"github.com/gabrielmilano/wager-wallet-service/internal/adapter/httpapi"
 	"github.com/gabrielmilano/wager-wallet-service/internal/adapter/oidc"
+	sqsadapter "github.com/gabrielmilano/wager-wallet-service/internal/adapter/sqs"
 	"github.com/gabrielmilano/wager-wallet-service/internal/app/wagering"
 	"github.com/gabrielmilano/wager-wallet-service/internal/app/wallets"
 	"github.com/gabrielmilano/wager-wallet-service/internal/platform/config"
 	"github.com/gabrielmilano/wager-wallet-service/internal/platform/logging"
+	"github.com/gabrielmilano/wager-wallet-service/internal/platform/metrics"
 )
 
 // Options monta a aplicação a partir da configuração já validada. Componentes
@@ -101,8 +105,32 @@ func newVerifier(cfg config.Config) *oidc.Verifier {
 	return oidc.NewVerifier(cfg.OIDC.IssuerURL, cfg.OIDC.JWKSURL, cfg.OIDC.Audience)
 }
 
-func newRouter(w *wagering.Service, ws *wallets.Service, v *oidc.Verifier, log *slog.Logger) http.Handler {
-	return httpapi.NewRouter(httpapi.Deps{Wagering: w, Wallets: ws, Verifier: v, Log: log})
+type routerParams struct {
+	fx.In
+	Wagering *wagering.Service
+	Wallets  *wallets.Service
+	Verifier *oidc.Verifier
+	Log      *slog.Logger
+	Metrics  *metrics.Metrics
+	Config   config.Config
+	Pool     *pgxpool.Pool
+	SQS      *awssqs.Client `optional:"true"` // só existe com consumidor ou publisher ligado
+}
+
+// newRouter monta a API com os checks de readiness: PostgreSQL sempre e SQS
+// quando algum componente usa a fila.
+func newRouter(p routerParams) http.Handler {
+	checks := []httpapi.ReadinessCheck{{Name: "postgres", Check: p.Pool.Ping}}
+	if p.SQS != nil {
+		checks = append(checks, httpapi.ReadinessCheck{Name: "sqs", Check: func(ctx context.Context) error {
+			_, err := sqsadapter.QueueURL(ctx, p.SQS, p.Config.AWS.InputQueueName)
+			return err
+		}})
+	}
+	return httpapi.NewRouter(httpapi.Deps{
+		Wagering: p.Wagering, Wallets: p.Wallets, Verifier: p.Verifier, Log: p.Log,
+		Metrics: p.Metrics, Readiness: checks,
+	})
 }
 
 // newHTTPServer liga o Server ao ciclo de vida. Se o servidor cair depois de

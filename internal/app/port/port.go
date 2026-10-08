@@ -30,3 +30,20 @@ func (SystemClock) Now() time.Time { return time.Now().UTC() }
 type UUIDv7 struct{}
 
 func (UUIDv7) NewID() uuid.UUID { return uuid.Must(uuid.NewV7()) }
+
+// Metrics é o que a camada de aplicação registra (implementado por
+// platform/metrics). Implementações devem aceitar chamadas concorrentes.
+type Metrics interface {
+	OutboxPublished(n int)
+	OutboxFailed()
+	OutboxBacklog(pending int, oldest time.Duration)
+	Reconciliation(consistent bool)
+}
+
+// NopMetrics não registra nada (testes e componentes sem métricas).
+type NopMetrics struct{}
+
+func (NopMetrics) OutboxPublished(int)              {}
+func (NopMetrics) OutboxFailed()                    {}
+func (NopMetrics) OutboxBacklog(int, time.Duration) {}
+func (NopMetrics) Reconciliation(bool)              {}

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/gabrielmilano/wager-wallet-service/internal/app/apperr"
 )
@@ -66,9 +67,13 @@ func (h *handlers) writeError(w http.ResponseWriter, r *http.Request, err error)
 		status = http.StatusNotFound
 	case apperr.Conflict:
 		status = http.StatusConflict
+		if e.Code == apperr.CodeIdempotencyConflict {
+			h.metrics.Conflict("idempotency")
+		}
 	case apperr.Unavailable:
 		status = http.StatusServiceUnavailable
 		w.Header().Set("Retry-After", "1")
+		h.metrics.Conflict(conflictReason(e))
 		h.log.Warn("falha transitória", slog.String("correlationId", correlationFrom(r.Context())), slog.Any("error", e.Err))
 	}
 	h.writeBody(w, r, status, errorBody{Code: e.Code, Message: e.Message})
@@ -90,4 +95,20 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 		return apperr.ValidationError("o corpo deve conter um único objeto JSON", nil)
 	}
 	return nil
+}
+
+// conflictReason classifica uma falha transitória para a métrica de
+// conflitos de concorrência.
+func conflictReason(err error) string {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "55P03"):
+		return "lock_timeout"
+	case strings.Contains(msg, "40P01"):
+		return "deadlock"
+	case strings.Contains(msg, "40001"):
+		return "serialization"
+	default:
+		return "unavailable"
+	}
 }

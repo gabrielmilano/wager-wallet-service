@@ -81,6 +81,7 @@ func (h *handlers) postTransaction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	started := time.Now()
 	res, err := h.wagering.Process(r.Context(), cmd, wagering.Metadata{
 		IdempotencyKey: r.Header.Get("Idempotency-Key"),
 		CorrelationID:  correlationFrom(r.Context()),
@@ -90,6 +91,7 @@ func (h *handlers) postTransaction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tx := res.Transaction
+	h.metrics.ObserveOperation("http", string(tx.Kind()), string(tx.Status()), res.Replay, time.Since(started))
 	h.log.Info("operação registrada",
 		slog.String("correlationId", correlationFrom(r.Context())),
 		slog.String("providerId", tx.ProviderID()),
@@ -286,6 +288,38 @@ func (h *handlers) getLedger(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	h.writeBody(w, r, http.StatusOK, view)
+}
+
+type reconciliationView struct {
+	WalletID          uuid.UUID   `json:"walletId"`
+	StoredBalance     money.Money `json:"storedBalance"`
+	CalculatedBalance money.Money `json:"calculatedBalance"`
+	Difference        money.Money `json:"difference"`
+	Consistent        bool        `json:"consistent"`
+	CheckedEntries    int         `json:"checkedEntries"`
+}
+
+// postReconciliation compara o saldo gravado com o reconstruído pelo extrato.
+// Divergência vai para a resposta, para o log (ERROR) e para a métrica.
+func (h *handlers) postReconciliation(w http.ResponseWriter, r *http.Request) {
+	id, ok := h.walletID(w, r)
+	if !ok {
+		return
+	}
+	rec, err := h.wallets.Reconcile(r.Context(), id)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	if !rec.Consistent {
+		h.log.Error("divergência na reconciliação", slog.String("correlationId", correlationFrom(r.Context())),
+			slog.String("walletId", id.String()), slog.String("storedBalance", rec.StoredBalance.Amount()),
+			slog.String("calculatedBalance", rec.CalculatedBalance.Amount()), slog.String("difference", rec.Difference.Amount()))
+	}
+	h.writeBody(w, r, http.StatusOK, reconciliationView{
+		WalletID: rec.WalletID, StoredBalance: rec.StoredBalance, CalculatedBalance: rec.CalculatedBalance,
+		Difference: rec.Difference, Consistent: rec.Consistent, CheckedEntries: rec.CheckedEntries,
+	})
 }
 
 func (h *handlers) walletID(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -18,6 +19,7 @@ import (
 	"github.com/gabrielmilano/wager-wallet-service/internal/app/apperr"
 	"github.com/gabrielmilano/wager-wallet-service/internal/app/wagering"
 	"github.com/gabrielmilano/wager-wallet-service/internal/domain/money"
+	"github.com/gabrielmilano/wager-wallet-service/internal/platform/metrics"
 )
 
 // ConsumerName identifica este consumidor na inbox.
@@ -42,6 +44,7 @@ type ConsumerConfig struct {
 	WaitTime       time.Duration // long polling (até 20 s)
 	MessageTimeout time.Duration // prazo para tratar uma mensagem
 	MaxRetryDelay  time.Duration // teto do backoff de visibilidade
+	Metrics        *metrics.Metrics
 }
 
 // Consumer lê wager-transactions.fifo. Para cada mensagem:
@@ -173,6 +176,7 @@ func (c *Consumer) handle(m types.Message) {
 	}
 
 	sum := sha256.Sum256([]byte(body))
+	started := time.Now()
 	res, err := c.processor.ProcessFromMessage(ctx, cmd,
 		wagering.Metadata{IdempotencyKey: data.IdempotencyKey, CorrelationID: env.MessageID, CausationID: env.MessageID},
 		wagering.InboundMessage{ConsumerName: ConsumerName, MessageID: env.MessageID, PayloadHash: sum[:]})
@@ -187,6 +191,8 @@ func (c *Consumer) handle(m types.Message) {
 	}
 
 	tx := res.Transaction
+	c.cfg.Metrics.ObserveOperation("sqs", string(tx.Kind()), string(tx.Status()), res.Replay, time.Since(started))
+	c.cfg.Metrics.SQSMessage("processed")
 	log.Info("mensagem processada",
 		slog.String("transactionId", tx.ID().String()), slog.String("walletId", tx.WalletID().String()),
 		slog.String("providerId", tx.ProviderID()), slog.String("status", string(tx.Status())),
@@ -232,6 +238,7 @@ func (c *Consumer) delete(ctx context.Context, log *slog.Logger, m types.Message
 // deduplica o reenvio à DLQ (MessageDeduplicationId = id da mensagem SQS).
 func (c *Consumer) deadLetter(ctx context.Context, log *slog.Logger, m types.Message, code, reason string) {
 	log.Warn("mensagem enviada à DLQ", slog.String("code", code), slog.String("reason", reason))
+	c.cfg.Metrics.SQSMessage("dead_letter")
 	group := m.Attributes[string(types.MessageSystemAttributeNameMessageGroupId)]
 	if group == "" {
 		group = "dlq"
@@ -258,6 +265,10 @@ func (c *Consumer) deadLetter(ctx context.Context, log *slog.Logger, m types.Mes
 func (c *Consumer) retryLater(log *slog.Logger, m types.Message, cause error) {
 	receives, _ := strconv.Atoi(m.Attributes[string(types.MessageSystemAttributeNameApproximateReceiveCount)])
 	delay := min(time.Second*time.Duration(1<<min(max(receives, 1), 10)), c.cfg.MaxRetryDelay)
+	c.cfg.Metrics.SQSMessage("retry")
+	if apperr.IsKind(cause, apperr.Unavailable) {
+		c.cfg.Metrics.Conflict(conflictReason(cause))
+	}
 	log.Warn("falha transitória; mensagem será reentregue", slog.Any("error", cause),
 		slog.Int("receiveCount", receives), slog.Duration("retryIn", delay))
 	c.setVisibility(m, delay)
@@ -266,6 +277,7 @@ func (c *Consumer) retryLater(log *slog.Logger, m types.Message, cause error) {
 // release devolve mensagens recebidas e não iniciadas (encerramento).
 func (c *Consumer) release(msgs []types.Message) {
 	for _, m := range msgs {
+		c.cfg.Metrics.SQSMessage("released")
 		c.setVisibility(m, 0)
 	}
 }
@@ -286,4 +298,16 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n]
+}
+
+func conflictReason(err error) string {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "55P03"):
+		return "lock_timeout"
+	case strings.Contains(msg, "40P01"):
+		return "deadlock"
+	default:
+		return "unavailable"
+	}
 }
