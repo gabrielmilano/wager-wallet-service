@@ -365,7 +365,49 @@ reversão `PROCESSED` (REFUND **ou** ROLLBACK), garantida pelo domínio e pelo �
 devolvido duas vezes). Um `ROLLBACK` do próprio `REFUND` é permitido (debita de volta),
 porque a original dele é o REFUND, e não a BET.
 
-## 15. Limitações e interpretações adotadas
+## 15. Mensageria: entrada SQS, inbox e outbox
+
+Detalhes em [ADR 0013](docs/adr/0013-mensageria-inbox-outbox.md).
+
+**Entrada (`wager-transactions.fifo`).**
+
+- Contrato para quem publica: corpo com o envelope do enunciado (`messageId`, `type =
+  WagerTransactionRequested`, `occurredAt`, `data`); `MessageGroupId = walletId` (as
+  operações de uma carteira chegam em ordem e uma por vez); `MessageDeduplicationId =
+  messageId`. A chave de idempotência é `data.idempotencyKey`.
+- O consumidor recebe até 10 mensagens por vez (long polling de 10 s) e as trata em
+  sequência, com prazo de 20 s por mensagem (o visibility timeout da fila é 30 s).
+- Identidade durável: `messageId` do envelope, registrado na inbox com o SHA-256 do corpo.
+  Reentrega com o mesmo hash → resultado gravado (sem novo efeito); mesmo `messageId` com
+  hash diferente → `MESSAGE_CONFLICT` → DLQ.
+- Destino de cada mensagem: sucesso, rejeição de negócio ou pendência → apaga depois do
+  commit. Mensagem inválida (`INVALID_MESSAGE`) ou erro corrigível → `SendMessage` para a
+  DLQ (atributos `failureCode` e `failureReason`) e apaga; se cair entre os dois passos, a
+  reentrega chega ao mesmo erro e o SQS deduplica o reenvio. Falha transitória ou
+  inesperada → não apaga e adia a reentrega com `ChangeMessageVisibility` (2 s, 4 s, 8 s...
+  até 60 s); depois de 5 recebimentos, o redrive da fila move a mensagem para a DLQ.
+- SQS indisponível: o laço de recebimento espera de forma crescente (até 30 s) e tenta
+  de novo.
+- `SIGTERM`: para de buscar mensagens, termina a mensagem em andamento e devolve a
+  visibilidade das recebidas e não iniciadas (reentrega imediata para outra instância).
+
+**Saída (`wallet-events.fifo`).**
+
+- Corpo: o envelope (`eventId`, `eventType`, `aggregateId`, `correlationId`,
+  `causationId` opcional, `occurredAt` em UTC, `version`, `data`). Atributos
+  `eventType` e `aggregateType` (`Wallet`) para roteamento sem abrir o corpo.
+- `MessageGroupId = aggregateId` (walletId): os eventos de uma carteira saem em ordem.
+  `MessageDeduplicationId = eventId`: republicação dentro de 5 min é descartada pelo SQS;
+  depois disso, o consumidor deve deduplicar pelo `eventId` (entrega pelo menos uma vez).
+- Publisher: lotes de 50 com `SKIP LOCKED` e lease de 30 s; confirma `published_at` depois
+  do envio; em falha, backoff de 1 s a 5 min, e os eventos seguintes da mesma carteira
+  esperam junto. Ao encerrar, libera na hora o resto do lote.
+- Recuperação provada em teste: queda entre o commit e a publicação (o evento continua na
+  outbox e outra instância publica), queda entre a publicação e a confirmação (lease vence
+  e o evento sai de novo com o mesmo `eventId`, deduplicado) e dois publishers disputando
+  a mesma outbox (cada evento enviado uma vez).
+
+## 16. Limitações e interpretações adotadas
 
 Interpretações (decididas sem regra explícita no enunciado):
 
@@ -392,14 +434,19 @@ Limitações:
 - O "despertar" imediato de reversões pendentes quando a original chega (correção 1 da
   modelagem) não foi implementado: a retomada depende do worker de pendências.
 - O dono das tabelas ou um superusuário pode desligar triggers (ADR 0011).
-- LocalStack Community não aplica IAM (ADR 0003 e 0008).
+- LocalStack Community não aplica IAM (ADR 0003 e 0008); o mapeamento `SenderId` →
+  `providerId` no consumidor não foi implementado.
+- A ordem dos eventos de uma carteira é garantida dentro de um publisher, mas dois
+  publishers podem reservar lotes diferentes da mesma carteira e enviá-los fora de ordem.
+  Consumidores devem usar `walletVersion` (em `WalletBalanceChanged`) e o `eventId` para
+  ordenar e deduplicar.
+- O consumidor trata as mensagens de um lote em sequência (o paralelismo vem de várias
+  instâncias e de vários grupos FIFO).
 
-## 16. Seções a definir
+## 17. Seções a definir
 
 | Tema | Fase |
 | --- | --- |
-| Inbox, visibility timeout, `MessageGroupId`/`MessageDeduplicationId` | 08 |
-| Outbox: lease, backoff, contrato dos eventos de saída | 09 |
 | Referências pendentes: backoff, TTL, estados da referência | 10 |
 | Reconciliação, observabilidade e health checks | 11 |
 | Testes de concorrência e falhas | 12 |
