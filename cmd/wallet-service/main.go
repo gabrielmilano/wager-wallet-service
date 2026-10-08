@@ -5,6 +5,7 @@
 //
 //	wallet-service              inicia a aplicação
 //	wallet-service healthcheck  verifica a liveness da instância local
+//	wallet-service migrate ...  aplica ou reverte as migrations (ADR 0010)
 package main
 
 import (
@@ -21,8 +22,13 @@ import (
 )
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
-		os.Exit(healthcheck())
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "healthcheck":
+			os.Exit(healthcheck())
+		case "migrate":
+			os.Exit(runMigrate(os.Args[2:], os.Stdout, os.Stderr))
+		}
 	}
 
 	cfg, err := config.Load(os.LookupEnv)
